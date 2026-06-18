@@ -9,10 +9,9 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms, datasets
 from PIL import Image
-import timm
 
 from config import (IMAGENET_C_CORRUPTIONS, CIFAR100_C_CORRUPTIONS,
-                    CRS_DOMAINS)
+                    CRS_DOMAINS, CASIA_MS_SPECTRUMS)
 
 
 # ─── ImageNet-C ───────────────────────────────────────────────────────
@@ -41,8 +40,7 @@ class ImageNetCDataset(Dataset):
 
 
 def get_imagenet_c_sequence(data_dir, severity=5, batch_size=50,
-                            num_workers=4, img_size=224, corruptions=None,
-                            backbone_name="vit_base_patch16_224"):
+                            num_workers=4, img_size=224, corruptions=None):
     """
     Returns a list of (corruption_name, DataLoader) pairs.
     corruptions: None  → all 15 standard corruptions
@@ -60,35 +58,22 @@ def get_imagenet_c_sequence(data_dir, severity=5, batch_size=50,
     else:
         run_corruptions = IMAGENET_C_CORRUPTIONS
 
-
-    # use timm's recommended transform for this specific checkpoint
-    model = timm.create_model(backbone_name, pretrained=False)
-    data_cfg = timm.data.resolve_model_data_config(model)
-    transform = timm.data.create_transform(**data_cfg, is_training=False)
-    del model  # don't need the model, just the transform
-
-    '''
-
-    # 2. Replicate the baseline's 'Res256Crop224' exactly using Bicubic interpolation:
     transform = transforms.Compose([
         transforms.Resize(256),
         transforms.CenterCrop(img_size),
         transforms.ToTensor(),
-        #transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                             #std=[0.229, 0.224, 0.225]),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                             std=[0.229, 0.224, 0.225]),
     ])
-    '''
-    
+
     loaders = []
     for corruption in run_corruptions:
         ds = ImageNetCDataset(data_dir, corruption, severity, transform)
-        # 3. Change shuffle back to False for stable evaluation tracking
-        loader = DataLoader(ds, batch_size=batch_size, shuffle=True, 
+        loader = DataLoader(ds, batch_size=batch_size, shuffle=False,
                             num_workers=num_workers, pin_memory=True,
                             drop_last=False)
         loaders.append((corruption, loader))
 
-    
     return loaders
 
 
@@ -136,7 +121,7 @@ def get_cifar100_c_sequence(data_dir, severity=5, batch_size=50,
     loaders = []
     for corruption in CIFAR100_C_CORRUPTIONS:
         ds = CIFAR100CDataset(data_dir, corruption, severity, transform)
-        loader = DataLoader(ds, batch_size=batch_size, shuffle=True, ## was False
+        loader = DataLoader(ds, batch_size=batch_size, shuffle=False,
                             num_workers=num_workers, pin_memory=True)
         loaders.append((corruption, loader))
 
@@ -273,12 +258,254 @@ def get_crs_sequence(data_dir, num_rounds=3, batch_size=50,
                 subset = ds
 
             loader = DataLoader(subset, batch_size=batch_size,
-                                shuffle=True, num_workers=num_workers,
+                                shuffle=False, num_workers=num_workers,
                                 pin_memory=True, drop_last=False)
             name = f"{domain}_R{round_idx+1}"
             sequence.append((name, loader))
 
     return sequence
+
+
+# ─── CASIA Multi-Spectral Palmprint ──────────────────────────────────
+
+import re
+from collections import defaultdict
+from sklearn.metrics import roc_curve
+
+
+def _parse_casia_filename(fname):
+    """
+    Parse CASIA-MS filename: {subjectID}_{handSide}_{spectrum}_{iteration}.jpg
+    Returns (identity, spectrum, iteration) where identity = subjectID_handSide.
+    """
+    base = os.path.splitext(fname)[0]
+    parts = base.split("_")
+    if len(parts) < 4:
+        return None, None, None
+    subject_id = parts[0]
+    hand_side = parts[1]
+    spectrum = parts[2]
+    iteration = parts[3]
+    identity = f"{subject_id}_{hand_side}"
+    return identity, spectrum, iteration
+
+
+class CASIAMSDataset(Dataset):
+    """CASIA Multi-Spectral palmprint dataset for a single spectrum."""
+
+    def __init__(self, root, spectrum, transform=None):
+        self.root = root
+        self.spectrum = spectrum
+        self.transform = transform
+        self.samples = []     # (path, identity_str)
+        self.identities = []  # unique identity strings
+        self.identity_to_idx = {}
+
+        # Scan all files matching this spectrum
+        all_files = sorted(os.listdir(root))
+        identity_samples = defaultdict(list)
+
+        for fname in all_files:
+            if not fname.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp')):
+                continue
+            identity, spec, iteration = _parse_casia_filename(fname)
+            if identity is None or spec != spectrum:
+                continue
+            fpath = os.path.join(root, fname)
+            identity_samples[identity].append(fpath)
+
+        # Build index
+        self.identities = sorted(identity_samples.keys())
+        self.identity_to_idx = {ident: idx for idx, ident in enumerate(self.identities)}
+
+        for ident in self.identities:
+            for fpath in identity_samples[ident]:
+                self.samples.append((fpath, self.identity_to_idx[ident]))
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        path, label = self.samples[idx]
+        img = Image.open(path).convert("RGB")
+        if self.transform:
+            img = self.transform(img)
+        return img, label
+
+    @property
+    def num_identities(self):
+        return len(self.identities)
+
+
+def split_gallery_probe(dataset, gallery_ratio=0.1, open_set=False,
+                         open_set_id_ratio=0.5, seed=2025):
+    """
+    Split a CASIAMSDataset into gallery and probe indices.
+
+    Closed-set: all identities appear in both gallery and probe.
+      gallery_ratio of each identity's samples → gallery, rest → probe.
+
+    Open-set: open_set_id_ratio of identities → gallery+probe (known).
+      Remaining identities → probe only (unknown).
+      For known identities, gallery_ratio split applies.
+
+    Returns: gallery_indices, probe_indices, probe_is_known (bool mask)
+    """
+    rng = np.random.RandomState(seed)
+
+    # Group sample indices by identity label
+    label_to_indices = defaultdict(list)
+    for i, (_, label) in enumerate(dataset.samples):
+        label_to_indices[label].append(i)
+
+    all_labels = sorted(label_to_indices.keys())
+    rng.shuffle(all_labels)
+
+    gallery_indices = []
+    probe_indices = []
+    probe_labels = []
+    probe_is_known = []
+
+    if open_set:
+        n_known = max(1, int(len(all_labels) * open_set_id_ratio))
+        known_labels = set(all_labels[:n_known])
+        unknown_labels = set(all_labels[n_known:])
+    else:
+        known_labels = set(all_labels)
+        unknown_labels = set()
+
+    for label in all_labels:
+        indices = label_to_indices[label]
+        rng.shuffle(indices)
+
+        if label in known_labels:
+            n_gallery = max(1, int(len(indices) * gallery_ratio))
+            gallery_indices.extend(indices[:n_gallery])
+            probe_indices.extend(indices[n_gallery:])
+            probe_labels.extend([label] * (len(indices) - n_gallery))
+            probe_is_known.extend([True] * (len(indices) - n_gallery))
+        else:
+            # Unknown identity — all samples go to probe
+            probe_indices.extend(indices)
+            probe_labels.extend([label] * len(indices))
+            probe_is_known.extend([False] * len(indices))
+
+    return gallery_indices, probe_indices, np.array(probe_is_known)
+
+
+def compute_eer(genuine_scores, impostor_scores):
+    """Compute Equal Error Rate from genuine and impostor similarity scores."""
+    labels = np.concatenate([np.ones(len(genuine_scores)),
+                              np.zeros(len(impostor_scores))])
+    scores = np.concatenate([genuine_scores, impostor_scores])
+    fpr, tpr, thresholds = roc_curve(labels, scores)
+    fnr = 1 - tpr
+    # Find the point where FPR ≈ FNR
+    idx = np.nanargmin(np.abs(fpr - fnr))
+    eer = (fpr[idx] + fnr[idx]) / 2
+    return eer * 100  # return as percentage
+
+
+def evaluate_verification(features, labels, gallery_idx, probe_idx,
+                           probe_is_known=None):
+    """
+    Compute EER and Rank-1 accuracy from extracted features.
+
+    features: (N, D) tensor — all features
+    labels: (N,) array — identity labels
+    gallery_idx: indices into features for gallery
+    probe_idx: indices into features for probe
+    probe_is_known: bool array, True if probe identity exists in gallery
+
+    Returns dict with eer, rank1, and open-set metrics if applicable.
+    """
+    gallery_feats = features[gallery_idx]
+    gallery_labels = labels[gallery_idx]
+    probe_feats = features[probe_idx]
+    probe_labels = labels[probe_idx]
+
+    # Normalize for cosine similarity
+    gallery_feats = F.normalize(gallery_feats, dim=-1)
+    probe_feats = F.normalize(probe_feats, dim=-1)
+
+    # Similarity matrix: (n_probe, n_gallery)
+    sim_matrix = probe_feats @ gallery_feats.T
+
+    # ─── Rank-1 accuracy (closed-set or known probes only) ───
+    if probe_is_known is not None:
+        known_mask = probe_is_known
+    else:
+        known_mask = np.ones(len(probe_idx), dtype=bool)
+
+    if known_mask.sum() > 0:
+        known_sims = sim_matrix[known_mask]
+        known_probe_labels = probe_labels[known_mask]
+        top1_gallery_idx = known_sims.argmax(dim=-1).cpu().numpy()
+        top1_predicted = gallery_labels[top1_gallery_idx]
+        rank1 = (top1_predicted == known_probe_labels).mean() * 100
+    else:
+        rank1 = 0.0
+
+    # ─── EER ───
+    # For each probe, find max similarity to same-identity gallery (genuine)
+    # and max similarity to different-identity gallery (impostor)
+    genuine_scores = []
+    impostor_scores = []
+
+    for i in range(len(probe_idx)):
+        p_label = probe_labels[i]
+        sims = sim_matrix[i].cpu().numpy()
+        same_mask = (gallery_labels == p_label)
+        diff_mask = ~same_mask
+
+        if same_mask.sum() > 0:
+            genuine_scores.append(sims[same_mask].max())
+        if diff_mask.sum() > 0:
+            impostor_scores.append(sims[diff_mask].max())
+
+    genuine_scores = np.array(genuine_scores)
+    impostor_scores = np.array(impostor_scores)
+
+    eer = compute_eer(genuine_scores, impostor_scores) if len(genuine_scores) > 0 and len(impostor_scores) > 0 else -1
+
+    result = {"eer": eer, "rank1": rank1,
+              "n_gallery": len(gallery_idx), "n_probe": len(probe_idx)}
+
+    # Open-set: also report known vs unknown detection
+    if probe_is_known is not None and not probe_is_known.all():
+        result["n_known_probe"] = int(known_mask.sum())
+        result["n_unknown_probe"] = int((~known_mask).sum())
+
+    return result
+
+
+def get_casia_ms_sequence(data_dir, batch_size=50, num_workers=4,
+                           img_size=224, spectrums=None):
+    """
+    Returns list of (spectrum_name, DataLoader, CASIAMSDataset) triples.
+    Each spectrum is treated as a separate domain.
+    """
+    run_spectrums = spectrums if spectrums else CASIA_MS_SPECTRUMS
+
+    transform = transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(img_size),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+    ])
+
+    loaders = []
+    for spectrum in run_spectrums:
+        ds = CASIAMSDataset(data_dir, spectrum, transform=transform)
+        if len(ds) == 0:
+            print(f"[WARNING] No samples found for spectrum '{spectrum}' in {data_dir}")
+            continue
+        loader = DataLoader(ds, batch_size=batch_size, shuffle=True,
+                            num_workers=num_workers, pin_memory=True,
+                            drop_last=False)
+        loaders.append((spectrum, loader, ds))
+
+    return loaders
 
 
 # ─── Unified interface ────────────────────────────────────────────────
@@ -287,6 +514,7 @@ def get_domain_sequence(cfg):
     """
     Build the domain sequence based on cfg.dataset.
     Returns list of (domain_name, DataLoader).
+    For casia_ms, returns (domain_name, DataLoader, CASIAMSDataset).
     """
     if cfg.dataset == "imagenet_c":
         return get_imagenet_c_sequence(
@@ -307,6 +535,11 @@ def get_domain_sequence(cfg):
         return get_crs_sequence(
             cfg.data_dir, cfg.num_rounds, cfg.batch_size,
             cfg.num_workers, cfg.img_size, plusplus=True)
+
+    elif cfg.dataset == "casia_ms":
+        return get_casia_ms_sequence(
+            cfg.data_dir, cfg.batch_size, cfg.num_workers,
+            cfg.img_size, cfg.casia_spectrums)
 
     else:
         raise ValueError(f"Unknown dataset: {cfg.dataset}")

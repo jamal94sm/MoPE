@@ -3,26 +3,28 @@ main.py — TENT Test-Time Adaptation.
 
 Two modes:
   ImageNet-C:  Classification — report error rate per corruption
-  CASIA-MS:    Verification   — report EER + Rank-1 per spectrum
+  CASIA-MS:    Verification — train ArcFace head, then TENT adapt
 
-Flow:
-  1. Load pretrained model
-  2. (Optional) Evaluate frozen backbone baseline
-  3. Configure model for TENT (BN train, everything else frozen)
-  4. For each domain: adapt BN params via entropy minimization
-  5. Evaluate after adaptation
+CASIA-MS flow:
+  1. Load ArcFace backbone (ONNX)
+  2. Evaluate frozen backbone on test spectrums (baseline)
+  3. Train ArcFace head on train spectrums
+  4. Evaluate trained model on test spectrums (post-training)
+  5. TENT: adapt BN layers on test spectrums via entropy minimization
+  6. Evaluate after TENT on test spectrums (post-TENT)
 """
 
-import os, json, time, random
+import os, json, time, random, math
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 from config import get_cfg, CASIA_ORACLE_LOOKUP, CASIA_ORACLE_DOMAINS
-from backbones import build_model
+from backbones import build_model, ArcFaceHead
 import tent
 from datasets import (
-    get_imagenet_c_loaders, get_casia_ms_loaders,
+    get_imagenet_c_loaders, get_casia_ms_train_test,
     split_gallery_probe, extract_embeddings, evaluate_verification,
 )
 
@@ -34,6 +36,35 @@ def set_seed(seed):
 
 
 # ══════════════════════════════════════════════════════════════
+#  Shared evaluation helper
+# ══════════════════════════════════════════════════════════════
+
+def eval_all_test_spectrums(model, test_loaders, gallery_ratio, batch_size,
+                             device, num_workers, seed, tag=""):
+    """Evaluate EER + Rank-1 on each test spectrum. Returns dict."""
+    was_training = model.training
+    model.eval()
+    results = {}
+    for sname, loader, ds in test_loaders:
+        gallery_idx, probe_idx = split_gallery_probe(ds, gallery_ratio, seed)
+        all_idx = list(range(len(ds)))
+        feats, labels = extract_embeddings(
+            model, ds, all_idx, batch_size, device, num_workers)
+        feats_t = feats.to(device)
+        ver = evaluate_verification(feats_t, labels, gallery_idx, probe_idx)
+        results[sname] = ver
+        print(f"  {tag}{sname:>6s} → EER: {ver['eer']:.2f}% | "
+              f"Rank-1: {ver['rank1']:.2f}% | "
+              f"Gal: {ver['n_gallery']} | Probe: {ver['n_probe']}")
+    mean_eer = np.mean([r['eer'] for r in results.values()])
+    mean_r1 = np.mean([r['rank1'] for r in results.values()])
+    print(f"  {tag}Mean EER: {mean_eer:.2f}% | Mean Rank-1: {mean_r1:.2f}%")
+    if was_training:
+        model.train()
+    return results
+
+
+# ══════════════════════════════════════════════════════════════
 #  ImageNet-C (Classification)
 # ══════════════════════════════════════════════════════════════
 
@@ -41,12 +72,10 @@ def adapt_imagenet_c(cfg):
     print(f"\n{'='*80}")
     print(f"  TENT — ImageNet-C Classification")
     print(f"  Backbone: {cfg.backbone} | LR: {cfg.tent_lr} | "
-          f"Steps/batch: {cfg.tent_steps} | "
-          f"Episodic: {cfg.tent_episodic}")
+          f"Steps/batch: {cfg.tent_steps} | Episodic: {cfg.tent_episodic}")
     print(f"{'='*80}\n")
 
     model = build_model(cfg)
-
     norm_mean = getattr(cfg, '_norm_mean', (0.5, 0.5, 0.5))
     norm_std = getattr(cfg, '_norm_std', (0.5, 0.5, 0.5))
 
@@ -54,7 +83,7 @@ def adapt_imagenet_c(cfg):
         cfg.data_dir, cfg.severity, cfg.batch_size, cfg.num_workers,
         cfg.img_size, cfg.corruptions, list(norm_mean), list(norm_std))
 
-    # ── Baseline evaluation ──
+    # Baseline
     baseline = {}
     if cfg.eval_backbone:
         print("[Baseline] Evaluating frozen backbone...")
@@ -72,7 +101,7 @@ def adapt_imagenet_c(cfg):
                 print(f"  {cname:25s} → {err:.1f}%")
         print(f"[Baseline] Mean: {np.mean(list(baseline.values())):.1f}%\n")
 
-    # ── Configure TENT ──
+    # TENT
     model = tent.configure_model(model)
     tent.check_model(model)
     params, param_names = tent.collect_params(model)
@@ -80,12 +109,9 @@ def adapt_imagenet_c(cfg):
     tented_model = tent.Tent(model, optimizer,
                              steps=cfg.tent_steps,
                              episodic=cfg.tent_episodic)
-
-    print(f"[TENT] {len(params)} BN parameters "
-          f"({sum(p.numel() for p in params)} values)")
+    print(f"[TENT] {len(params)} BN params ({sum(p.numel() for p in params)} values)")
 
     results = {}
-
     for seg_idx, (cname, loader) in enumerate(loaders):
         if cfg.tent_episodic:
             tented_model.reset()
@@ -95,24 +121,19 @@ def adapt_imagenet_c(cfg):
         t0 = time.time()
 
         print(f"\n{'─'*70}")
-        print(f"  [{seg_idx+1}/{len(loaders)}] {cname} "
-              f"({len(loader.dataset)} samples)")
+        print(f"  [{seg_idx+1}/{len(loaders)}] {cname} ({len(loader.dataset)} samples)")
         print(f"{'─'*70}")
         print(f"  {'bat':>5} │{'err%':>6} │{'H':>6}")
 
         for batch_idx, (imgs, labs) in enumerate(loader):
             imgs, labs = imgs.to(cfg.device), labs.to(cfg.device)
-
             logits = tented_model(imgs)
-
             preds = logits.argmax(1)
             correct = (preds == labs).sum().item()
-            seg_correct += correct
-            seg_total += labs.shape[0]
+            seg_correct += correct; seg_total += labs.shape[0]
             err = 100.0 * (1 - correct / labs.shape[0])
 
-            if batch_idx < 5 or batch_idx % 100 == 0 or \
-               batch_idx == n_batches - 1:
+            if batch_idx < 5 or batch_idx % 100 == 0 or batch_idx == n_batches - 1:
                 H = tent.softmax_entropy(logits).mean().item()
                 print(f"  {batch_idx:5d} │{err:5.1f} │{H:6.3f}")
 
@@ -131,7 +152,6 @@ def adapt_imagenet_c(cfg):
         print(f"  │ Time: {elapsed:.1f}s")
         print(f"  └{'─'*50}")
 
-    # ── Final summary ──
     _print_classification_summary(results, baseline, cfg)
 
 
@@ -165,14 +185,11 @@ def _print_classification_summary(results, baseline, cfg):
         print(f"  {'MEAN':<25} {mean_tent:>9.1f}%")
 
     os.makedirs(cfg.output_dir, exist_ok=True)
-    save_data = {"tent": results, "mean_tent": mean_tent,
-                 "backbone": cfg.backbone, "tent_lr": cfg.tent_lr}
-    if baseline:
-        save_data["baseline"] = baseline
-        save_data["mean_baseline"] = mean_base
     p = os.path.join(cfg.output_dir, f"imagenetc_{cfg.backbone}_seed{cfg.seed}.json")
     with open(p, "w") as f:
-        json.dump(save_data, f, indent=2)
+        json.dump({"tent": results, "mean_tent": mean_tent,
+                    "backbone": cfg.backbone,
+                    **({"baseline": baseline} if baseline else {})}, f, indent=2)
     print(f"\n  Saved: {p}")
 
 
@@ -183,104 +200,167 @@ def _print_classification_summary(results, baseline, cfg):
 def adapt_casia_ms(cfg):
     print(f"\n{'='*80}")
     print(f"  TENT — CASIA-MS Palmprint Verification")
-    print(f"  Backbone: ArcFace iResNet100 | LR: {cfg.tent_lr} | "
-          f"Steps/batch: {cfg.tent_steps}")
-    print(f"  Gallery ratio: {cfg.gallery_ratio} | "
-          f"Episodic: {cfg.tent_episodic}")
+    print(f"  Backbone: ArcFace iResNet100")
+    print(f"  ArcFace training: {cfg.arcface_epochs} epochs, "
+          f"LR={cfg.arcface_lr} (head only, backbone frozen)")
+    print(f"  TENT: LR={cfg.tent_lr}, steps={cfg.tent_steps}, "
+          f"episodic={cfg.tent_episodic}")
+    print(f"  Gallery ratio: {cfg.gallery_ratio}")
     if cfg.oracle_domains:
-        print(f"  Domain grouping: ORACLE (3 groups)")
+        print(f"  TENT domain grouping: ORACLE (3 groups)")
         for gn, specs in CASIA_ORACLE_DOMAINS.items():
             print(f"    {gn}: {specs}")
-    else:
-        print(f"  Domain grouping: per-spectrum")
     print(f"{'='*80}\n")
 
+    # ── Step 1: Build datasets ──
+    identity_to_idx, num_identities, train_loader, test_loaders = \
+        get_casia_ms_train_test(
+            cfg.data_dir, cfg.train_spectrums, cfg.batch_size,
+            cfg.num_workers, cfg.img_size)
+
+    cfg.arcface_num_classes = num_identities
+
+    # ── Step 2: Build model ──
     model = build_model(cfg)
 
-    loaders = get_casia_ms_loaders(
-        cfg.data_dir, cfg.batch_size, cfg.num_workers,
-        cfg.img_size, cfg.casia_spectrums)
+    trainable = sum(p.numel() for p in model.head.parameters())
+    total = sum(p.numel() for p in model.parameters())
+    print(f"[Model] Head params: {trainable/1e6:.2f}M | "
+          f"Total: {total/1e6:.2f}M (backbone frozen)")
 
-    print(f"[Data] {len(loaders)} spectrums:")
-    for sname, loader, ds in loaders:
-        print(f"  {sname}: {len(ds)} samples, {ds.num_identities} IDs")
+    # ── Step 3: Evaluate frozen backbone (pre-training baseline) ──
+    print(f"\n{'─'*70}")
+    print(f"  PHASE 1: Frozen Backbone Baseline")
+    print(f"{'─'*70}")
+    baseline = eval_all_test_spectrums(
+        model, test_loaders, cfg.gallery_ratio, cfg.batch_size,
+        cfg.device, cfg.num_workers, cfg.seed, tag="[baseline] ")
 
-    # ── Baseline evaluation ──
-    baseline = {}
-    if cfg.eval_backbone:
-        print(f"\n[Baseline] Evaluating frozen backbone on each spectrum...")
-        model.eval()
-        for sname, loader, ds in loaders:
-            gallery_idx, probe_idx = split_gallery_probe(
-                ds, cfg.gallery_ratio, cfg.seed)
-            all_idx = list(range(len(ds)))
-            feats, labels = extract_embeddings(
-                model, ds, all_idx, cfg.batch_size, cfg.device,
-                cfg.num_workers)
-            feats_t = feats.to(cfg.device)
-            result = evaluate_verification(
-                feats_t, labels, gallery_idx, probe_idx)
-            baseline[sname] = result
-            print(f"  {sname:>6s} → EER: {result['eer']:.2f}% | "
-                  f"Rank-1: {result['rank1']:.2f}% | "
-                  f"Gal: {result['n_gallery']} | Probe: {result['n_probe']}")
-        mean_eer = np.mean([r['eer'] for r in baseline.values()])
-        mean_r1 = np.mean([r['rank1'] for r in baseline.values()])
-        print(f"[Baseline] Mean EER: {mean_eer:.2f}% | "
-              f"Mean Rank-1: {mean_r1:.2f}%\n")
+    # ── Step 4: Train ArcFace head ──
+    print(f"\n{'─'*70}")
+    print(f"  PHASE 2: ArcFace Head Training ({cfg.arcface_epochs} epochs)")
+    print(f"  Train spectrums: {cfg.train_spectrums}")
+    print(f"  {num_identities} identity classes, "
+          f"{len(train_loader.dataset)} train samples")
+    print(f"{'─'*70}")
 
-    # ── Configure TENT ──
+    # Only train the ArcFace head — backbone is frozen
+    train_params = list(model.head.parameters())
+    optimizer = torch.optim.AdamW(train_params, lr=cfg.arcface_lr,
+                                   weight_decay=cfg.arcface_wd)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=cfg.arcface_epochs, eta_min=1e-6)
+    ce_loss = nn.CrossEntropyLoss()
+
+    best_rank1 = 0.0
+    ckpt_path = os.path.join(cfg.output_dir, "arcface_best.pth")
+    os.makedirs(cfg.output_dir, exist_ok=True)
+
+    model.train()
+    for epoch in range(1, cfg.arcface_epochs + 1):
+        ep_loss = 0.0; ep_corr = 0; ep_tot = 0
+
+        for imgs, labels in train_loader:
+            imgs, labels = imgs.to(cfg.device), labels.to(cfg.device)
+            optimizer.zero_grad()
+
+            logits = model.train_forward(imgs, labels)
+            loss = ce_loss(logits, labels)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(train_params, 5.0)
+            optimizer.step()
+
+            ep_loss += loss.item()
+            with torch.no_grad():
+                ep_corr += (logits.argmax(1) == labels).sum().item()
+                ep_tot += labels.shape[0]
+
+        scheduler.step()
+        acc = 100.0 * ep_corr / max(ep_tot, 1)
+        n = len(train_loader)
+        ts = time.strftime("%H:%M:%S")
+        print(f"  [{ts}] ep {epoch:03d}/{cfg.arcface_epochs}  "
+              f"loss={ep_loss/n:.4f}  acc={acc:.2f}%")
+
+        if epoch % cfg.arcface_eval_every == 0 or epoch == cfg.arcface_epochs:
+            print(f"  --- eval at epoch {epoch} ---")
+            ver_results = eval_all_test_spectrums(
+                model, test_loaders, cfg.gallery_ratio, cfg.batch_size,
+                cfg.device, cfg.num_workers, cfg.seed, tag="  ")
+            mean_r1 = np.mean([r['rank1'] for r in ver_results.values()])
+            if mean_r1 > best_rank1:
+                best_rank1 = mean_r1
+                torch.save({
+                    "epoch": epoch,
+                    "model": model.backbone.state_dict(),
+                    "arc": model.head.state_dict(),
+                    "rank1": best_rank1,
+                }, ckpt_path)
+                print(f"  *** New best Rank-1: {best_rank1:.2f}% → saved ***")
+
+    # Load best checkpoint
+    if os.path.exists(ckpt_path):
+        ckpt = torch.load(ckpt_path, map_location=cfg.device, weights_only=False)
+        model.backbone.load_state_dict(ckpt["model"])
+        model.head.load_state_dict(ckpt["arc"])
+        print(f"\n  Loaded best checkpoint (epoch {ckpt['epoch']}, "
+              f"Rank-1={ckpt['rank1']:.2f}%)")
+
+    # ── Step 5: Evaluate after training (pre-TENT) ──
+    print(f"\n{'─'*70}")
+    print(f"  PHASE 3: Post-Training Evaluation")
+    print(f"{'─'*70}")
+    post_train = eval_all_test_spectrums(
+        model, test_loaders, cfg.gallery_ratio, cfg.batch_size,
+        cfg.device, cfg.num_workers, cfg.seed, tag="[trained] ")
+
+    # ── Step 6: TENT adaptation on test spectrums ──
+    print(f"\n{'─'*70}")
+    print(f"  PHASE 4: TENT Adaptation on Test Spectrums")
+    print(f"{'─'*70}")
+
     model = tent.configure_model(model)
     tent.check_model(model)
     params, param_names = tent.collect_params(model)
-    optimizer = torch.optim.Adam(params, lr=cfg.tent_lr)
-    tented_model = tent.Tent(model, optimizer,
-                             steps=cfg.tent_steps,
-                             episodic=cfg.tent_episodic)
+    tent_optimizer = torch.optim.Adam(params, lr=cfg.tent_lr)
+    tented_model = tent.Tent(model, tent_optimizer,
+                              steps=cfg.tent_steps,
+                              episodic=cfg.tent_episodic)
 
-    print(f"[TENT] {len(params)} BN parameters "
+    print(f"[TENT] {len(params)} BN params "
           f"({sum(p.numel() for p in params)} values)")
 
-    # ── Group spectrums by oracle domain if enabled ──
+    # Group spectrums by oracle domain if enabled
     if cfg.oracle_domains:
         from collections import OrderedDict
         groups = OrderedDict()
-        for sname, loader, ds in loaders:
+        for sname, loader, ds in test_loaders:
             gname, gid = CASIA_ORACLE_LOOKUP.get(sname, ("unk", -1))
             if gid not in groups:
                 groups[gid] = {"name": gname, "spectrums": []}
             groups[gid]["spectrums"].append((sname, loader, ds))
-        domain_sequence = []
-        for gid, ginfo in groups.items():
-            domain_sequence.append((ginfo["name"], gid, ginfo["spectrums"]))
+        domain_sequence = [(gi["name"], gid, gi["spectrums"])
+                           for gid, gi in groups.items()]
     else:
-        domain_sequence = [(sname, i, [(sname, loader, ds)])
-                           for i, (sname, loader, ds) in enumerate(loaders)]
-
-    results = {}
+        domain_sequence = [(s, i, [(s, ld, ds)])
+                           for i, (s, ld, ds) in enumerate(test_loaders)]
 
     for dom_idx, (dom_name, dom_id, spectrum_list) in enumerate(domain_sequence):
         if cfg.tent_episodic:
             tented_model.reset()
 
-        total_samples = sum(len(ds) for _, _, ds in spectrum_list)
         total_batches = sum(len(ld) for _, ld, _ in spectrum_list)
         spec_names = [s for s, _, _ in spectrum_list]
+        t0 = time.time()
 
-        print(f"\n{'─'*70}")
-        print(f"  [{dom_idx+1}/{len(domain_sequence)}] Domain: {dom_name} "
-              f"(spectrums: {spec_names}, {total_samples} samples)")
-        print(f"{'─'*70}")
+        print(f"\n  [{dom_idx+1}/{len(domain_sequence)}] Domain: {dom_name} "
+              f"({spec_names})")
         print(f"  {'bat':>5} │{'spec':>6} │{'H':>6}")
 
-        t0 = time.time()
         global_batch = 0
-
-        # ── Adapt on all spectrums in this domain ──
         for sname, loader, ds in spectrum_list:
             for batch_idx, (imgs, labs) in enumerate(loader):
                 imgs = imgs.to(cfg.device)
-
                 logits = tented_model(imgs)
 
                 if global_batch < 5 or global_batch % 50 == 0 or \
@@ -289,101 +369,62 @@ def adapt_casia_ms(cfg):
                     print(f"  {global_batch:5d} │{sname:>6s} │{H:6.3f}")
                 global_batch += 1
 
-        elapsed = time.time() - t0
+        print(f"  Time: {time.time() - t0:.1f}s")
 
-        # ── Evaluate after adaptation ──
-        print(f"\n  [Evaluating after TENT on {dom_name}...]")
-        # Switch to eval for embedding extraction
-        # (BN will use batch stats since track_running_stats=False)
-        model.eval()
+    # ── Step 7: Evaluate after TENT ──
+    print(f"\n{'─'*70}")
+    print(f"  PHASE 5: Post-TENT Evaluation")
+    print(f"{'─'*70}")
+    model.eval()
+    post_tent = eval_all_test_spectrums(
+        model, test_loaders, cfg.gallery_ratio, cfg.batch_size,
+        cfg.device, cfg.num_workers, cfg.seed, tag="[tent] ")
 
-        for sname, loader, ds in spectrum_list:
-            gallery_idx, probe_idx = split_gallery_probe(
-                ds, cfg.gallery_ratio, cfg.seed)
-            all_idx = list(range(len(ds)))
-            feats, labels = extract_embeddings(
-                model, ds, all_idx, cfg.batch_size, cfg.device,
-                cfg.num_workers)
-            feats_t = feats.to(cfg.device)
-            ver = evaluate_verification(feats_t, labels, gallery_idx, probe_idx)
-            results[sname] = ver
-
-            b = baseline.get(sname)
-            print(f"\n  ┌── {sname}")
-            if b:
-                de = b["eer"] - ver["eer"]
-                dr = ver["rank1"] - b["rank1"]
-                print(f"  │ Backbone → EER: {b['eer']:.2f}% | "
-                      f"Rank-1: {b['rank1']:.2f}%")
-                print(f"  │ TENT    → EER: {ver['eer']:.2f}% | "
-                      f"Rank-1: {ver['rank1']:.2f}%")
-                print(f"  │ Change: EER {'↓' if de > 0 else '↑'}"
-                      f"{abs(de):.2f}% | Rank-1 {'↑' if dr > 0 else '↓'}"
-                      f"{abs(dr):.2f}%")
-            else:
-                print(f"  │ EER: {ver['eer']:.2f}% | "
-                      f"Rank-1: {ver['rank1']:.2f}%")
-            print(f"  │ Gallery: {ver['n_gallery']} | "
-                  f"Probe: {ver['n_probe']}")
-            print(f"  └{'─'*50}")
-
-        # Back to train mode for next domain
-        model.train()
-        print(f"  Time: {elapsed:.1f}s")
-
-    # ── Final summary ──
-    _print_verification_summary(results, baseline, cfg)
-
-
-def _print_verification_summary(results, baseline, cfg):
+    # ── Final comparison table ──
     print(f"\n{'='*80}")
-    print(f"  FINAL RESULTS: CASIA-MS Verification")
+    print(f"  FINAL COMPARISON: CASIA-MS Verification")
+    print(f"  Train spectrums: {cfg.train_spectrums}")
     print(f"{'='*80}")
-    print(f"\n  {'Spectrum':<10} ", end="")
-    if baseline:
-        print(f"{'BB EER':>8} {'BB R1':>8} {'TENT EER':>9} {'TENT R1':>8} "
-              f"{'ΔEER':>8} {'ΔR1':>8}")
-    else:
-        print(f"{'EER':>8} {'Rank-1':>8}")
-    print(f"  {'─'*75}")
+    print(f"\n  {'Spectrum':<10} {'BB EER':>8} {'BB R1':>8} "
+          f"{'Trn EER':>8} {'Trn R1':>8} "
+          f"{'TNT EER':>8} {'TNT R1':>8}")
+    print(f"  {'─'*65}")
 
-    for sname, r in results.items():
-        if baseline and sname in baseline:
-            b = baseline[sname]
-            de = b["eer"] - r["eer"]
-            dr = r["rank1"] - b["rank1"]
-            print(f"  {sname:<10} {b['eer']:>7.2f}% {b['rank1']:>7.2f}% "
-                  f"{r['eer']:>8.2f}% {r['rank1']:>7.2f}% "
-                  f"{'↓' if de > 0 else '↑'}{abs(de):>6.2f}% "
-                  f"{'↑' if dr > 0 else '↓'}{abs(dr):>6.2f}%")
-        else:
-            print(f"  {sname:<10} {r['eer']:>7.2f}% {r['rank1']:>7.2f}%")
+    for sname in post_tent:
+        b = baseline.get(sname, {})
+        t = post_train.get(sname, {})
+        n = post_tent[sname]
+        print(f"  {sname:<10} "
+              f"{b.get('eer', -1):>7.2f}% {b.get('rank1', -1):>7.2f}% "
+              f"{t.get('eer', -1):>7.2f}% {t.get('rank1', -1):>7.2f}% "
+              f"{n['eer']:>7.2f}% {n['rank1']:>7.2f}%")
 
-    mean_eer = np.mean([r['eer'] for r in results.values()])
-    mean_r1 = np.mean([r['rank1'] for r in results.values()])
-    print(f"  {'─'*75}")
-    if baseline:
-        bm_eer = np.mean([r['eer'] for r in baseline.values()])
-        bm_r1 = np.mean([r['rank1'] for r in baseline.values()])
-        de = bm_eer - mean_eer
-        dr = mean_r1 - bm_r1
-        print(f"  {'MEAN':<10} {bm_eer:>7.2f}% {bm_r1:>7.2f}% "
-              f"{mean_eer:>8.2f}% {mean_r1:>7.2f}% "
-              f"{'↓' if de > 0 else '↑'}{abs(de):>6.2f}% "
-              f"{'↑' if dr > 0 else '↓'}{abs(dr):>6.2f}%")
-    else:
-        print(f"  {'MEAN':<10} {mean_eer:>7.2f}% {mean_r1:>7.2f}%")
+    def _mean(d, k):
+        return np.mean([r[k] for r in d.values()]) if d else -1
 
+    print(f"  {'─'*65}")
+    print(f"  {'MEAN':<10} "
+          f"{_mean(baseline,'eer'):>7.2f}% {_mean(baseline,'rank1'):>7.2f}% "
+          f"{_mean(post_train,'eer'):>7.2f}% {_mean(post_train,'rank1'):>7.2f}% "
+          f"{_mean(post_tent,'eer'):>7.2f}% {_mean(post_tent,'rank1'):>7.2f}%")
+
+    # Save
     os.makedirs(cfg.output_dir, exist_ok=True)
-    save_data = {"tent": {k: dict(v) for k, v in results.items()},
-                 "mean_eer": mean_eer, "mean_rank1": mean_r1,
-                 "tent_lr": cfg.tent_lr, "gallery_ratio": cfg.gallery_ratio}
-    if baseline:
-        save_data["baseline"] = {k: dict(v) for k, v in baseline.items()}
-    p = os.path.join(cfg.output_dir, f"casia_ms_tent_seed{cfg.seed}.json")
+    save_data = {
+        "baseline": {k: dict(v) for k, v in baseline.items()},
+        "post_train": {k: dict(v) for k, v in post_train.items()},
+        "post_tent": {k: dict(v) for k, v in post_tent.items()},
+        "train_spectrums": cfg.train_spectrums,
+        "arcface_epochs": cfg.arcface_epochs,
+        "tent_lr": cfg.tent_lr,
+        "gallery_ratio": cfg.gallery_ratio,
+    }
+    p = os.path.join(cfg.output_dir, f"casia_ms_full_seed{cfg.seed}.json")
     with open(p, "w") as f:
         json.dump(save_data, f, indent=2)
     print(f"\n  Saved: {p}")
+    if os.path.exists(ckpt_path):
+        print(f"  Best ArcFace checkpoint: {ckpt_path}")
 
 
 # ══════════════════════════════════════════════════════════════

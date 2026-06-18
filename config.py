@@ -55,7 +55,7 @@ def get_cfg(args=None):
                         "treating each spectrum as a separate domain")
 
     # ─── ArcFace training ─────────────────────────────────────
-    p.add_argument("--arcface_epochs", type=int, default=5,
+    p.add_argument("--arcface_epochs", type=int, default=1,
                    help="Epochs to train ArcFace head on train spectrums")
     p.add_argument("--arcface_lr", type=float, default=1e-4,
                    help="Learning rate for ArcFace training")

@@ -5,3 +5,6 @@ For identification accuracy, cross-domain (Reg: training domains, Qry: target do
 mope_convnext_mkmmd.py: L2-norm consitency loss is added. GRL is replaced by MK-MMD loss.
 
 mope_cnn.py: replace ConvNeXt model with a small custom CNN model.
+
+python main.py --dataset casia_ms --data_dir /home/pai-ng/Jamal/CASIA-MS-ROI \
+    --eval_backbone --gallery_ratio 0.1

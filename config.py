@@ -63,12 +63,14 @@ def get_cfg(args=None):
                    help="Weight decay for ArcFace training")
     p.add_argument("--arcface_eval_every", type=int, default=5,
                    help="Evaluate on test set every N epochs")
-    p.add_argument("--arcface_freeze_ratio", type=float, default=1.0,
+    p.add_argument("--arcface_freeze_ratio", type=float, default=0.75,
                    help="Fraction of backbone params to freeze during training. "
-                        "1.0 = freeze entire backbone, only train ArcFace head.")
+                        "0.75 = freeze first 75%%, finetune last 25%%. "
+                        "1.0 = freeze all (head only — only works if backbone "
+                        "already produces good embeddings for your domain).")
 
     # ─── Backbone ─────────────────────────────────────────────
-    p.add_argument("--backbone", default="arcface_r100",
+    p.add_argument("--backbone", default="vit_base",
                    choices=["vit_base", "resnet50", "resnet101",
                             "arcface_r100"])
     p.add_argument("--arcface_onnx", type=str,

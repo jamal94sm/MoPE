@@ -202,7 +202,7 @@ def adapt_casia_ms(cfg):
     print(f"  TENT — CASIA-MS Palmprint Verification")
     print(f"  Backbone: ArcFace iResNet100")
     print(f"  ArcFace training: {cfg.arcface_epochs} epochs, "
-          f"LR={cfg.arcface_lr} (head only, backbone frozen)")
+          f"LR={cfg.arcface_lr}, backbone freeze={cfg.arcface_freeze_ratio}")
     print(f"  TENT: LR={cfg.tent_lr}, steps={cfg.tent_steps}, "
           f"episodic={cfg.tent_episodic}")
     print(f"  Gallery ratio: {cfg.gallery_ratio}")
@@ -223,10 +223,10 @@ def adapt_casia_ms(cfg):
     # ── Step 2: Build model ──
     model = build_model(cfg)
 
-    trainable = sum(p.numel() for p in model.head.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
-    print(f"[Model] Head params: {trainable/1e6:.2f}M | "
-          f"Total: {total/1e6:.2f}M (backbone frozen)")
+    print(f"[Model] Trainable: {trainable/1e6:.2f}M / {total/1e6:.2f}M total "
+          f"(freeze_ratio={cfg.arcface_freeze_ratio})")
 
     # ── Step 3: Evaluate frozen backbone (pre-training baseline) ──
     print(f"\n{'─'*70}")
@@ -244,8 +244,12 @@ def adapt_casia_ms(cfg):
           f"{len(train_loader.dataset)} train samples")
     print(f"{'─'*70}")
 
-    # Only train the ArcFace head — backbone is frozen
+    # Train head + any unfrozen backbone params
     train_params = list(model.head.parameters())
+    unfrozen_bb = [p for p in model.backbone.parameters() if p.requires_grad]
+    if unfrozen_bb:
+        train_params = unfrozen_bb + train_params
+        print(f"[Train] Head + {len(unfrozen_bb)} unfrozen backbone tensors")
     optimizer = torch.optim.AdamW(train_params, lr=cfg.arcface_lr,
                                    weight_decay=cfg.arcface_wd)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(

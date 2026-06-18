@@ -15,7 +15,7 @@ import torch.nn.functional as F
 from torch.optim import Adam
 from collections import Counter, deque
 
-from config import get_cfg, ORACLE_LOOKUP
+from config import get_cfg, ORACLE_LOOKUP, CASIA_ORACLE_LOOKUP
 from model import build_model
 from fdd import FrequencyDomainDiscriminator
 from datasets import get_domain_sequence
@@ -507,7 +507,10 @@ def adapt_casia_ms(cfg):
     eval_mode = "OPEN-SET" if cfg.casia_open_set else "CLOSED-SET"
     print(f"  Evaluation: {eval_mode} | Gallery ratio: {cfg.gallery_ratio}")
     if cfg.oracle_domains:
-        print(f"  Domain detection: ORACLE (spectrums)")
+        from config import CASIA_ORACLE_DOMAINS
+        print(f"  Domain detection: ORACLE (3 spectrum groups)")
+        for gn, specs in CASIA_ORACLE_DOMAINS.items():
+            print(f"    {gn}: {specs}")
     else:
         print(f"  Domain detection: FDD (online, τ={cfg.fdd_threshold})")
     print(f"{'='*90}\n")
@@ -576,6 +579,7 @@ def adapt_casia_ms(cfg):
     current_fdd_domain = -1; global_step = 0
     batches_since_new_domain = 0
     pl_loss_history = deque(maxlen=20)
+    known_oracle_domains = set()
 
     norm_mean = torch.tensor([0.5, 0.5, 0.5]).view(1, 3, 1, 1)
     norm_std = torch.tensor([0.5, 0.5, 0.5]).view(1, 3, 1, 1)
@@ -592,9 +596,18 @@ def adapt_casia_ms(cfg):
         pl_total_agreed = pl_total_samples = 0
         pl_loss_sum = 0.0; pl_dropped_count = 0
 
+        # Oracle: determine domain for this spectrum upfront
+        if cfg.oracle_domains:
+            group_name, group_id = CASIA_ORACLE_LOOKUP.get(spec_name, ("unk", 0))
+            is_new_oracle = (group_id not in known_oracle_domains)
+            if is_new_oracle:
+                known_oracle_domains.add(group_id)
+
         print(f"\n{'─'*90}")
         print(f"  [{seg_idx+1}/{len(domain_sequence)}] Spectrum: {spec_name} "
               f"({len(ds)} samples, {ds.num_identities} IDs, {n_batches} batches)")
+        if cfg.oracle_domains:
+            print(f"  Oracle group: {group_name} (domain {group_id})")
         print(f"{'─'*90}")
         print(hdr)
 
@@ -605,8 +618,14 @@ def adapt_casia_ms(cfg):
             raw_images = images * std_t + mean_t
 
             # ─── Domain detection ───
-            fdd_domain_id, is_new = fdd.detect_domain(raw_images)
-            fdd_distances = fdd.distances_to_all_domains(raw_images)
+            if cfg.oracle_domains:
+                fdd_domain_id = group_id
+                is_new = is_new_oracle and batch_idx == 0
+                fdd_distances = fdd.distances_to_all_domains(raw_images)
+                fdd.detect_domain(raw_images)  # update stats only
+            else:
+                fdd_domain_id, is_new = fdd.detect_domain(raw_images)
+                fdd_distances = fdd.distances_to_all_domains(raw_images)
 
             if is_new:
                 expert_id = model.expand_domain()
@@ -615,7 +634,8 @@ def adapt_casia_ms(cfg):
                 domain_map.setdefault(fdd_domain_id, []).append(spec_name)
                 batches_since_new_domain = 0
                 pl_loss_history.clear()
-                print(f"  >>> [bat {batch_idx}] New domain {fdd_domain_id} (FDD) "
+                lbl = f"oracle:{group_name}" if cfg.oracle_domains else "FDD"
+                print(f"  >>> [bat {batch_idx}] New domain {fdd_domain_id} ({lbl}) "
                       f"→ expert e{expert_id} (warmup {cfg.pl_warmup})")
                 if optimizer is None:
                     optimizer = Adam(model.get_trainable_params(),

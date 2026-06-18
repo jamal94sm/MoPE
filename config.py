@@ -18,6 +18,10 @@ CRS_DOMAINS = ["imagenet_v2", "imagenet_a", "imagenet_r", "imagenet_sketch"]
 
 ACDC_DOMAINS = ["fog", "night", "rain", "snow"]
 
+# ─── CASIA Multi-Spectral Palmprint ──────────────────────────────────
+# Spectrums in CASIA-MS-ROI dataset. Each spectrum = one domain.
+CASIA_MS_SPECTRUMS = ["460", "630", "700", "850", "940", "WHT"]
+
 # Oracle domain families for controlled cross-expert experiments.
 # One expert per group. Within-group experts should help each other,
 # across-group experts should not.
@@ -45,7 +49,8 @@ def get_cfg(args=None):
     # data
     p.add_argument("--dataset", default="imagenet_c",
                    choices=["imagenet_c", "cifar100_c",
-                            "imagenet_plus", "imagenet_plusplus", "acdc"])
+                            "imagenet_plus", "imagenet_plusplus", "acdc",
+                            "casia_ms"])
     p.add_argument("--data_dir", default="./data/ImageNet-C")
     p.add_argument("--severity", type=int, default=5)
     p.add_argument("--corruptions", nargs="*", default=None,
@@ -57,8 +62,25 @@ def get_cfg(args=None):
     p.add_argument("--num_rounds", type=int, default=3,
                    help="Rounds for CRS benchmark")
 
+    # ─── CASIA-MS specific ───
+    p.add_argument("--casia_spectrums", nargs="*", default=None,
+                   help="Which spectrums to use as domains. None=all 6. "
+                        "Examples: --casia_spectrums 460 630 WHT")
+    p.add_argument("--casia_open_set", action="store_true", default=False,
+                   help="Open-set evaluation: gallery and probe have "
+                        "disjoint identities (some probe IDs unseen)")
+    p.add_argument("--casia_closed_set", dest="casia_open_set",
+                   action="store_false",
+                   help="Closed-set evaluation (default): all probe "
+                        "identities appear in gallery")
+    p.add_argument("--gallery_ratio", type=float, default=0.1,
+                   help="Fraction of samples per identity for gallery "
+                        "(rest goes to probe). Default 0.1 = 10%% gallery")
+    p.add_argument("--open_set_id_ratio", type=float, default=0.5,
+                   help="Fraction of identities in gallery for open-set. "
+                        "Remaining identities only appear in probe.")
+
     # backbone
-    # vit_base_patch16_224.orig_in21k_ft_in1k, vit_base_patch16_224, vit_base_patch16_224.augreg_in21k_ft_in1k
     p.add_argument("--backbone", default="vit_base_patch16_224")
     p.add_argument("--img_size", type=int, default=224)
     p.add_argument("--num_classes", type=int, default=1000)
@@ -92,6 +114,18 @@ def get_cfg(args=None):
                    help="Bottleneck dim for high-rank domain experts when "
                         "--vida_domain is set. Higher = more capacity. "
                         "Recommended: 64-256. Paper ViDA uses 256.")
+
+    # ─── Single expert mode (no gating/router) ───
+    # Standard: MoE with N experts + gating network per branch.
+    # Single expert: one adapter per branch, no router overhead.
+    #   Shared branch: 1 low-rank adapter (rank = shared_rank)
+    #   Domain branch: 1 high-rank adapter (rank = domain_rank or domain_high_rank)
+    p.add_argument("--single_expert", action="store_true", default=False,
+                   help="Use single adapter per branch instead of MoE. "
+                        "Removes gating network. Shared = 1 low-rank, "
+                        "Domain = 1 (high-rank if --vida_domain).")
+    p.add_argument("--no_single_expert", dest="single_expert",
+                   action="store_false")
 
     # FDD (Section 3.3)
     p.add_argument("--fdd_freq_radius", type=int, default=16,
@@ -226,6 +260,7 @@ def get_cfg(args=None):
             "imagenet_plus": 5e-4,
             "imagenet_plusplus": 5e-4,
             "acdc": 3e-4,
+            "casia_ms": 1e-5,
         }
         cfg.lr = lr_map[cfg.dataset]
 
@@ -234,6 +269,12 @@ def get_cfg(args=None):
         cfg.num_classes = 100
         cfg.img_size = 384          # paper resizes CIFAR to 384
         cfg.backbone = "vit_base_patch16_384"
+
+    # ── CASIA-MS: classification head unused, we do verification ──
+    if cfg.dataset == "casia_ms":
+        cfg.is_verification = True
+    else:
+        cfg.is_verification = False
 
     # ── entropy threshold κ × ln(C) ──
     cfg.entropy_threshold = cfg.confidence_threshold * math.log(cfg.num_classes)

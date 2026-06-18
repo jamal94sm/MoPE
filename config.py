@@ -45,7 +45,7 @@ def get_cfg(args=None):
     p.add_argument("--num_workers", type=int, default=4)
 
     # ─── CASIA-MS specific ────────────────────────────────────
-    p.add_argument("--train_spectrums", nargs="*", default=["WHT"],
+    p.add_argument("--train_spectrums", nargs="*", default=["460"],
                    help="Spectrums for ArcFace head training. "
                         "Test spectrums = all remaining spectrums.")
     p.add_argument("--gallery_ratio", type=float, default=0.1,

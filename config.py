@@ -68,7 +68,7 @@ def get_cfg(args=None):
                         "1.0 = freeze entire backbone, only train ArcFace head.")
 
     # ─── Backbone ─────────────────────────────────────────────
-    p.add_argument("--backbone", default="vit_base",
+    p.add_argument("--backbone", default="arcface_r100",
                    choices=["vit_base", "resnet50", "resnet101",
                             "arcface_r100"])
     p.add_argument("--arcface_onnx", type=str,

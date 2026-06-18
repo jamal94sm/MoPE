@@ -22,6 +22,19 @@ ACDC_DOMAINS = ["fog", "night", "rain", "snow"]
 # Spectrums in CASIA-MS-ROI dataset. Each spectrum = one domain.
 CASIA_MS_SPECTRUMS = ["460", "630", "700", "850", "940", "WHT"]
 
+# Oracle domain families for CASIA-MS (bypass FDD)
+CASIA_ORACLE_DOMAINS = {
+    "visible":   ["WHT", "460"],
+    "red_nir":   ["630", "700"],
+    "nir":       ["850", "940"],
+}
+
+# Reverse lookup: spectrum → (group_name, group_id)
+CASIA_ORACLE_LOOKUP = {}
+for gid, (gname, spectrums) in enumerate(CASIA_ORACLE_DOMAINS.items()):
+    for s in spectrums:
+        CASIA_ORACLE_LOOKUP[s] = (gname, gid)
+
 # Oracle domain families for controlled cross-expert experiments.
 # One expert per group. Within-group experts should help each other,
 # across-group experts should not.

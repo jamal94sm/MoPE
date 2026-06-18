@@ -195,8 +195,9 @@ class ArcFaceModel(nn.Module):
     """
     Combined ArcFace backbone + classification head.
 
-    forward(x) returns logits (for TENT — model(x) must return logits)
-    get_embeddings(x) returns L2-normalized 512-d embeddings (for verification)
+    forward(x): logits without margin (for TENT entropy minimization)
+    train_forward(x, labels): logits with angular margin (for ArcFace training)
+    get_embeddings(x): L2-normalized 512-d embeddings (for verification)
     """
     def __init__(self, backbone, head):
         super().__init__()
@@ -208,9 +209,14 @@ class ArcFaceModel(nn.Module):
         return self.backbone(x)
 
     def forward(self, x):
-        """For TENT: returns logits (no margin, inference mode)."""
+        """For TENT: returns logits without margin."""
         emb = self.backbone(x)
         return self.head(emb, labels=None)
+
+    def train_forward(self, x, labels):
+        """For ArcFace training: returns logits with angular margin."""
+        emb = self.backbone(x)
+        return self.head(emb, labels=labels)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -245,16 +251,33 @@ def load_resnet(variant="resnet50", num_classes=1000):
 #  Unified loader
 # ══════════════════════════════════════════════════════════════
 
+def _count_casia_identities(data_dir):
+    """Count unique identities (subjectID_handSide) in CASIA-MS directory."""
+    identities = set()
+    if not os.path.isdir(data_dir):
+        return 0
+    for fname in os.listdir(data_dir):
+        if not fname.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp')):
+            continue
+        base = os.path.splitext(fname)[0]
+        parts = base.split("_")
+        if len(parts) >= 4:
+            identities.add(f"{parts[0]}_{parts[1]}")
+    return len(identities)
+
+
 def build_model(cfg):
     """
     Build and return model based on cfg.backbone.
 
     Returns:
       For classification (imagenet_c): model that outputs logits
-      For verification (casia_ms): ArcFaceModel with .get_embeddings() and .get_logits()
+      For verification (casia_ms): ArcFaceModel with .get_embeddings()
+                                    and forward() returning logits
     """
     if cfg.backbone == "arcface_r100":
-        backbone = ArcFaceBackbone(cfg.arcface_onnx)
+        backbone = ArcFaceBackbone(cfg.arcface_onnx,
+                                   freeze_ratio=cfg.arcface_freeze_ratio)
 
         # Load trained ArcFace head from checkpoint
         if cfg.arcface_ckpt and os.path.exists(cfg.arcface_ckpt):
@@ -285,10 +308,17 @@ def build_model(cfg):
                 print(f"  [ArcFace] Loaded head weights from checkpoint")
         else:
             if cfg.arcface_num_classes is None:
-                raise ValueError(
-                    "ArcFace requires --arcface_ckpt (trained checkpoint) "
-                    "or --arcface_num_classes for TENT. The classification "
-                    "head is needed for entropy computation.")
+                # Auto-detect from dataset
+                n_cls = _count_casia_identities(cfg.data_dir)
+                if n_cls > 0:
+                    cfg.arcface_num_classes = n_cls
+                    print(f"  [ArcFace] Auto-detected {n_cls} identities "
+                          f"from {cfg.data_dir}")
+                else:
+                    raise ValueError(
+                        "ArcFace requires --arcface_ckpt (trained checkpoint) "
+                        "or --arcface_num_classes. Could not auto-detect "
+                        f"identities from {cfg.data_dir}")
             head = ArcFaceHead(cfg.arcface_num_classes,
                                embedding_size=512,
                                s=cfg.arcface_s, m=cfg.arcface_m)

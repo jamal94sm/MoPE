@@ -45,13 +45,27 @@ def get_cfg(args=None):
     p.add_argument("--num_workers", type=int, default=4)
 
     # ─── CASIA-MS specific ────────────────────────────────────
-    p.add_argument("--casia_spectrums", nargs="*", default=None,
-                   help="Which spectrums. None=all 6.")
+    p.add_argument("--train_spectrums", nargs="*", default=["WHT", "940"],
+                   help="Spectrums for ArcFace head training. "
+                        "Test spectrums = all remaining spectrums.")
     p.add_argument("--gallery_ratio", type=float, default=0.1,
                    help="Fraction of samples per ID for gallery (rest=probe)")
     p.add_argument("--oracle_domains", action="store_true", default=False,
                    help="Use oracle 3-group spectrum assignment instead of "
                         "treating each spectrum as a separate domain")
+
+    # ─── ArcFace training ─────────────────────────────────────
+    p.add_argument("--arcface_epochs", type=int, default=50,
+                   help="Epochs to train ArcFace head on train spectrums")
+    p.add_argument("--arcface_lr", type=float, default=1e-4,
+                   help="Learning rate for ArcFace training")
+    p.add_argument("--arcface_wd", type=float, default=5e-4,
+                   help="Weight decay for ArcFace training")
+    p.add_argument("--arcface_eval_every", type=int, default=5,
+                   help="Evaluate on test set every N epochs")
+    p.add_argument("--arcface_freeze_ratio", type=float, default=1.0,
+                   help="Fraction of backbone params to freeze during training. "
+                        "1.0 = freeze entire backbone, only train ArcFace head.")
 
     # ─── Backbone ─────────────────────────────────────────────
     p.add_argument("--backbone", default="vit_base",

@@ -28,6 +28,47 @@ def set_seed(seed):
     torch.backends.cudnn.deterministic = True
 
 
+# ─── Feature extraction for verification tasks ──────────────────────
+
+@torch.no_grad()
+def extract_features(model, dataset, indices, batch_size, device,
+                     num_workers=4, use_cls_token=True):
+    """
+    Extract features from model for given sample indices.
+    For ViT: uses the [CLS] token output (before classification head).
+    Returns (features, labels) tensors.
+    """
+    from torch.utils.data import Subset, DataLoader
+    subset = Subset(dataset, indices)
+    loader = DataLoader(subset, batch_size=batch_size, shuffle=False,
+                        num_workers=num_workers, pin_memory=True)
+
+    all_feats = []
+    all_labels = []
+    for imgs, labs in loader:
+        imgs = imgs.to(device)
+        # Get features before classification head
+        if hasattr(model, 'backbone'):
+            backbone = model.backbone
+        else:
+            backbone = model
+
+        # ViT: forward_features returns [CLS] token
+        if hasattr(backbone, 'forward_features'):
+            feats = backbone.forward_features(imgs)
+            # timm ViT: forward_features returns (B, D) after pool
+            # or (B, N+1, D) before pool — handle both
+            if feats.dim() == 3:
+                feats = feats[:, 0]  # [CLS] token
+        else:
+            feats = backbone(imgs)
+
+        all_feats.append(feats.cpu())
+        all_labels.append(labs)
+
+    return torch.cat(all_feats, dim=0), np.concatenate([l.numpy() for l in all_labels])
+
+
 def filtered_entropy_loss(logits, threshold, entropy_floor=0.0, div_lambda=0.0):
     probs = F.softmax(logits, dim=-1)
     log_probs = F.log_softmax(logits, dim=-1)
@@ -456,5 +497,351 @@ def _compute_rf(results, cfg):
     if rv: print(f"    Mean RF: {np.mean(rv):+.1f}")
 
 
+def adapt_casia_ms(cfg):
+    """Adaptation loop for CASIA-MS palmprint verification."""
+    from datasets import split_gallery_probe, evaluate_verification
+
+    print(f"\n{'='*90}")
+    print(f"  AAAI 2026: Shared & Domain Self-Adaptive Experts with FDD")
+    print(f"  Dataset: CASIA-MS Palmprint | LR: {cfg.lr} | BS: {cfg.batch_size}")
+    eval_mode = "OPEN-SET" if cfg.casia_open_set else "CLOSED-SET"
+    print(f"  Evaluation: {eval_mode} | Gallery ratio: {cfg.gallery_ratio}")
+    if cfg.oracle_domains:
+        print(f"  Domain detection: ORACLE (spectrums)")
+    else:
+        print(f"  Domain detection: FDD (online, τ={cfg.fdd_threshold})")
+    print(f"{'='*90}\n")
+
+    model = build_model(cfg)
+    print(f"[Model] Backbone: {cfg.backbone}")
+    print(f"[Model] Shared rank: {cfg.shared_rank}, "
+          f"Domain rank: {cfg.domain_rank}, Experts/MoE: {cfg.num_experts_per_moe}")
+
+    fdd = FrequencyDomainDiscriminator(
+        freq_radius=cfg.fdd_freq_radius, threshold=cfg.fdd_threshold,
+        shrinkage=cfg.fdd_shrinkage, init_var=cfg.fdd_init_var,
+        diagonal=cfg.fdd_diagonal, device=cfg.device)
+    print(f"[FDD] freq_radius={cfg.fdd_freq_radius}, "
+          f"threshold={cfg.fdd_threshold}, diagonal={cfg.fdd_diagonal}")
+
+    domain_sequence = get_domain_sequence(cfg)
+    total_batches = sum(len(loader) for _, loader, _ in domain_sequence)
+    print(f"[Data] {len(domain_sequence)} spectrums, {total_batches} total batches")
+    for spec_name, loader, ds in domain_sequence:
+        print(f"  spectrum {spec_name}: {len(ds)} samples, "
+              f"{ds.num_identities} identities")
+    print(f"[Anti-collapse] entropy_floor={cfg.entropy_floor}, "
+          f"stochastic_restore={cfg.stochastic_restore}, div_lambda={cfg.div_lambda}")
+    print(f"[Optimizer] Constant LR={cfg.lr}, weight_decay={cfg.weight_decay}")
+    if cfg.use_pseudo_labels:
+        pl_mode = f"soft (sharpness={cfg.pl_sharpness})" if cfg.pl_soft else "hard"
+        print(f"[PL] ENABLED: mode={pl_mode}, lambda={cfg.pl_lambda}")
+    else:
+        print(f"[PL] Disabled")
+
+    # ── Backbone baseline verification ──
+    baseline_results = {}
+    if cfg.eval_backbone:
+        print(f"\n[Baseline] Evaluating frozen backbone on each spectrum...")
+        model.eval()
+        for spec_name, loader, ds in domain_sequence:
+            gallery_idx, probe_idx, probe_is_known = split_gallery_probe(
+                ds, gallery_ratio=cfg.gallery_ratio,
+                open_set=cfg.casia_open_set,
+                open_set_id_ratio=cfg.open_set_id_ratio,
+                seed=cfg.seed)
+
+            all_indices = list(range(len(ds)))
+            feats, labels = extract_features(
+                model, ds, all_indices, cfg.batch_size, cfg.device,
+                cfg.num_workers)
+
+            feats_t = feats.to(cfg.device)
+            result = evaluate_verification(
+                feats_t, labels, gallery_idx, probe_idx,
+                probe_is_known if cfg.casia_open_set else None)
+
+            baseline_results[spec_name] = result
+            print(f"  {spec_name:>6s} → EER: {result['eer']:.2f}% | "
+                  f"Rank-1: {result['rank1']:.2f}% | "
+                  f"Gallery: {result['n_gallery']} | Probe: {result['n_probe']}")
+
+        mean_eer = np.mean([r['eer'] for r in baseline_results.values()])
+        mean_r1 = np.mean([r['rank1'] for r in baseline_results.values()])
+        print(f"[Baseline] Mean EER: {mean_eer:.2f}% | Mean Rank-1: {mean_r1:.2f}%\n")
+
+    # ── Adaptation loop ──
+    optimizer = None
+    results = {}; domain_map = {}
+    current_fdd_domain = -1; global_step = 0
+    batches_since_new_domain = 0
+    pl_loss_history = deque(maxlen=20)
+
+    norm_mean = torch.tensor([0.5, 0.5, 0.5]).view(1, 3, 1, 1)
+    norm_std = torch.tensor([0.5, 0.5, 0.5]).view(1, 3, 1, 1)
+
+    hdr = (f"  {'bat':>5} │{'H_mn':>5} │{'flt%':>4} │{'dom':>3}")
+    if cfg.use_pseudo_labels:
+        hdr += f" │{'PL%':>3} │{'PLls':>6} │{'phs':>4}"
+
+    for seg_idx, (spec_name, loader, ds) in enumerate(domain_sequence):
+        n_batches = len(loader); t0 = time.time()
+        seg_loss_sum = 0.0; seg_total = 0
+        updates_applied = updates_skipped = 0
+        warmup_batches_used = 0
+        pl_total_agreed = pl_total_samples = 0
+        pl_loss_sum = 0.0; pl_dropped_count = 0
+
+        print(f"\n{'─'*90}")
+        print(f"  [{seg_idx+1}/{len(domain_sequence)}] Spectrum: {spec_name} "
+              f"({len(ds)} samples, {ds.num_identities} IDs, {n_batches} batches)")
+        print(f"{'─'*90}")
+        print(hdr)
+
+        for batch_idx, (images, labels) in enumerate(loader):
+            images = images.to(cfg.device); labels = labels.to(cfg.device)
+            B = images.shape[0]
+            mean_t = norm_mean.to(cfg.device); std_t = norm_std.to(cfg.device)
+            raw_images = images * std_t + mean_t
+
+            # ─── Domain detection ───
+            fdd_domain_id, is_new = fdd.detect_domain(raw_images)
+            fdd_distances = fdd.distances_to_all_domains(raw_images)
+
+            if is_new:
+                expert_id = model.expand_domain()
+                model.set_active_domain(expert_id)
+                current_fdd_domain = fdd_domain_id
+                domain_map.setdefault(fdd_domain_id, []).append(spec_name)
+                batches_since_new_domain = 0
+                pl_loss_history.clear()
+                print(f"  >>> [bat {batch_idx}] New domain {fdd_domain_id} (FDD) "
+                      f"→ expert e{expert_id} (warmup {cfg.pl_warmup})")
+                if optimizer is None:
+                    optimizer = Adam(model.get_trainable_params(),
+                                    lr=cfg.lr, betas=(0.9, 0.999),
+                                    weight_decay=cfg.weight_decay)
+                else:
+                    new_params = []
+                    for em in model.expert_modules:
+                        if expert_id < len(em.domain_moes):
+                            new_params.extend(em.domain_moes[expert_id].parameters())
+                    if new_params:
+                        optimizer.add_param_group({
+                            'params': new_params, 'lr': cfg.lr,
+                            'betas': (0.9, 0.999), 'weight_decay': cfg.weight_decay})
+            elif fdd_domain_id != current_fdd_domain:
+                model.set_active_domain(fdd_domain_id)
+                current_fdd_domain = fdd_domain_id
+                domain_map.setdefault(fdd_domain_id, []).append(spec_name)
+                batches_since_new_domain = 0
+                pl_loss_history.clear()
+                print(f"  >>> [bat {batch_idx}] Switched to domain {fdd_domain_id} "
+                      f"→ expert e{fdd_domain_id}")
+
+            # ─── Forward ───
+            logits = model(images)
+            probs = F.softmax(logits, dim=-1)
+            entropy = -(probs * torch.log(probs + 1e-8)).sum(dim=-1)
+
+            filt_mask = entropy < cfg.entropy_threshold
+            if cfg.entropy_floor > 0:
+                filt_mask = filt_mask & (entropy > cfg.entropy_floor)
+            pass_rate = filt_mask.float().mean().item() * 100
+
+            # ─── Losses ───
+            ent_loss = filtered_entropy_loss(logits, cfg.entropy_threshold,
+                                              cfg.entropy_floor, cfg.div_lambda)
+
+            in_warmup = (cfg.use_pseudo_labels and
+                         batches_since_new_domain < cfg.pl_warmup)
+            phase = "warm" if in_warmup else "pl"
+
+            batch_pl_loss = 0.0; batch_pl_rate = 0.0; pl_was_dropped = False
+
+            if cfg.use_pseudo_labels and not in_warmup:
+                pseudo_labels_t, pl_mask, teacher_probs, pl_stats = \
+                    get_teacher_signals(model, images, current_fdd_domain, cfg,
+                                        fdd_distances=fdd_distances)
+                pl_loss, loss_stats = compute_pl_loss(
+                    logits, pseudo_labels_t, pl_mask, teacher_probs, cfg)
+
+                batch_pl_loss = loss_stats["pl_loss"]
+                batch_pl_rate = pl_stats["agreement_rate"]
+                pl_total_agreed += loss_stats["pl_samples"]
+                pl_total_samples += B
+                pl_loss_sum += batch_pl_loss * B
+
+                # Circuit breaker
+                use_pl = True
+                if len(pl_loss_history) >= 5 and batch_pl_loss > 0:
+                    running_avg = sum(pl_loss_history) / len(pl_loss_history)
+                    if running_avg > 0 and batch_pl_loss > 5.0 * running_avg:
+                        use_pl = False; pl_was_dropped = True
+                        pl_dropped_count += 1; phase = "drop"
+                if use_pl and batch_pl_loss > 0:
+                    pl_loss_history.append(batch_pl_loss)
+
+                total_loss = ent_loss
+                if use_pl and cfg.pl_lambda > 0 and pl_loss.item() > 0:
+                    total_loss = total_loss + cfg.pl_lambda * pl_loss
+            else:
+                total_loss = ent_loss
+                if in_warmup: warmup_batches_used += 1
+
+            seg_loss_sum += total_loss.item() * B; seg_total += B
+
+            # ─── Update ───
+            if optimizer is not None and total_loss.item() > 0:
+                optimizer.zero_grad()
+                total_loss.backward()
+                optimizer.step()
+                updates_applied += 1
+            else:
+                updates_skipped += 1
+
+            batches_since_new_domain += 1
+
+            # ─── Print ───
+            if batch_idx < 5 or batch_idx % 50 == 0 or batch_idx == n_batches - 1:
+                line = (f"  {batch_idx:5d} │{entropy.mean().item():5.2f} │"
+                        f"{pass_rate:4.0f} │{current_fdd_domain:>3d}")
+                if cfg.use_pseudo_labels:
+                    if in_warmup:
+                        line += f" │ -- │   -- │{'warm':>4s}"
+                    else:
+                        dr = "!" if pl_was_dropped else " "
+                        line += (f" │{batch_pl_rate:3.0f} │"
+                                 f"{batch_pl_loss:5.3f}{dr} │{phase:>4s}")
+                print(line)
+
+            global_step += 1
+
+        elapsed = time.time() - t0
+        seg_loss_avg = seg_loss_sum / max(seg_total, 1)
+
+        # ─── Post-adaptation verification on this spectrum ───
+        print(f"\n  [Evaluating after adaptation on {spec_name}...]")
+        model.eval()
+
+        gallery_idx, probe_idx, probe_is_known = split_gallery_probe(
+            ds, gallery_ratio=cfg.gallery_ratio,
+            open_set=cfg.casia_open_set,
+            open_set_id_ratio=cfg.open_set_id_ratio,
+            seed=cfg.seed)
+
+        all_indices = list(range(len(ds)))
+        feats, feat_labels = extract_features(
+            model, ds, all_indices, cfg.batch_size, cfg.device,
+            cfg.num_workers)
+        feats_t = feats.to(cfg.device)
+        ver_result = evaluate_verification(
+            feats_t, feat_labels, gallery_idx, probe_idx,
+            probe_is_known if cfg.casia_open_set else None)
+
+        results[spec_name] = {
+            "eer": ver_result["eer"], "rank1": ver_result["rank1"],
+            "loss": seg_loss_avg, "fdd_domain": current_fdd_domain,
+            "time": elapsed, "n_gallery": ver_result["n_gallery"],
+            "n_probe": ver_result["n_probe"],
+        }
+
+        model.train()
+
+        baseline_r = baseline_results.get(spec_name, None)
+        print(f"\n  ┌── SUMMARY: spectrum {spec_name} "
+              f"(FDD domain {current_fdd_domain})")
+        if baseline_r:
+            eer_imp = baseline_r["eer"] - ver_result["eer"]
+            r1_imp = ver_result["rank1"] - baseline_r["rank1"]
+            print(f"  │ Backbone  → EER: {baseline_r['eer']:.2f}% | "
+                  f"Rank-1: {baseline_r['rank1']:.2f}%")
+            print(f"  │ After TTA → EER: {ver_result['eer']:.2f}% | "
+                  f"Rank-1: {ver_result['rank1']:.2f}%")
+            print(f"  │ Improvement: EER {'↓' if eer_imp > 0 else '↑'}"
+                  f"{abs(eer_imp):.2f}% | Rank-1 {'↑' if r1_imp > 0 else '↓'}"
+                  f"{abs(r1_imp):.2f}%")
+        else:
+            print(f"  │ EER: {ver_result['eer']:.2f}% | "
+                  f"Rank-1: {ver_result['rank1']:.2f}%")
+        print(f"  │ Loss: {seg_loss_avg:.4f} | FDD: {fdd.num_domains} domains | "
+              f"Updates: {updates_applied}/{updates_applied + updates_skipped} | "
+              f"Time: {elapsed:.1f}s")
+        print(f"  │ Gallery: {ver_result['n_gallery']} | "
+              f"Probe: {ver_result['n_probe']}")
+        if cfg.use_pseudo_labels:
+            pl_avg_rate = 100.0 * pl_total_agreed / max(pl_total_samples, 1)
+            print(f"  │ PL: {pl_avg_rate:.1f}% agreed | "
+                  f"PL dropped: {pl_dropped_count} batches")
+        print(f"  │ Step: {global_step}/{total_batches}")
+        print(f"  └{'─'*70}")
+
+    # ─── Final summary ──
+    print(f"\n{'='*90}")
+    print(f"  FINAL RESULTS: CASIA-MS Palmprint Verification ({eval_mode})")
+    print(f"{'='*90}")
+    print(f"\n  {'Spectrum':<10} ", end="")
+    if baseline_results:
+        print(f"{'BB EER':>8} {'BB R1':>8} {'TTA EER':>9} {'TTA R1':>8} "
+              f"{'ΔEER':>8} {'ΔR1':>8} {'FDD':>5}")
+    else:
+        print(f"{'EER':>8} {'Rank-1':>8} {'FDD':>5}")
+    print(f"  {'─'*80}")
+
+    for spec_name, r in results.items():
+        if baseline_results and spec_name in baseline_results:
+            b = baseline_results[spec_name]
+            de = b["eer"] - r["eer"]; dr = r["rank1"] - b["rank1"]
+            print(f"  {spec_name:<10} {b['eer']:>7.2f}% {b['rank1']:>7.2f}% "
+                  f"{r['eer']:>8.2f}% {r['rank1']:>7.2f}% "
+                  f"{'↓' if de > 0 else '↑'}{abs(de):>6.2f}% "
+                  f"{'↑' if dr > 0 else '↓'}{abs(dr):>6.2f}% "
+                  f"{r['fdd_domain']:>5d}")
+        else:
+            print(f"  {spec_name:<10} {r['eer']:>7.2f}% {r['rank1']:>7.2f}% "
+                  f"{r['fdd_domain']:>5d}")
+
+    mean_eer = np.mean([r['eer'] for r in results.values()])
+    mean_r1 = np.mean([r['rank1'] for r in results.values()])
+    print(f"  {'─'*80}")
+    if baseline_results:
+        bm_eer = np.mean([r['eer'] for r in baseline_results.values()])
+        bm_r1 = np.mean([r['rank1'] for r in baseline_results.values()])
+        de = bm_eer - mean_eer; dr = mean_r1 - bm_r1
+        print(f"  {'MEAN':<10} {bm_eer:>7.2f}% {bm_r1:>7.2f}% "
+              f"{mean_eer:>8.2f}% {mean_r1:>7.2f}% "
+              f"{'↓' if de > 0 else '↑'}{abs(de):>6.2f}% "
+              f"{'↑' if dr > 0 else '↓'}{abs(dr):>6.2f}%")
+    else:
+        print(f"  {'MEAN':<10} {mean_eer:>7.2f}% {mean_r1:>7.2f}%")
+
+    print(f"\n  FDD domains: {fdd.num_domains}")
+
+    # Save
+    save_data = {"tta": {k: dict(v) for k, v in results.items()},
+                 "mean_eer": mean_eer, "mean_rank1": mean_r1,
+                 "fdd_domains": fdd.num_domains,
+                 "eval_mode": "open" if cfg.casia_open_set else "closed",
+                 "gallery_ratio": cfg.gallery_ratio}
+    if baseline_results:
+        save_data["baseline"] = {k: dict(v) for k, v in baseline_results.items()}
+        save_data["mean_baseline_eer"] = bm_eer
+        save_data["mean_baseline_rank1"] = bm_r1
+    os.makedirs(cfg.output_dir, exist_ok=True)
+    p = os.path.join(cfg.output_dir, f"casia_ms_seed{cfg.seed}.json")
+    with open(p, "w") as f: json.dump(save_data, f, indent=2)
+    print(f"\n  Saved: {p}")
+
+    print(f"\n  FDD domain → spectrum mapping:")
+    for fid, names in domain_map.items():
+        print(f"    domain {fid} (expert e{fid}) → {list(set(names))}")
+
+    return results
+
+
 if __name__ == "__main__":
-    cfg = get_cfg(); set_seed(cfg.seed); adapt(cfg)
+    cfg = get_cfg(); set_seed(cfg.seed)
+    if cfg.dataset == "casia_ms":
+        adapt_casia_ms(cfg)
+    else:
+        adapt(cfg)

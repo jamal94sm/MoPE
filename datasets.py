@@ -94,33 +94,47 @@ def _parse_casia_filename(fname):
     return f"{parts[0]}_{parts[1]}", parts[2], parts[3]
 
 
+def build_global_identity_map(data_dir):
+    """
+    Scan ALL files in data_dir and build a consistent identity → index mapping.
+    This ensures the same identity gets the same label across all spectrums.
+
+    Returns:
+        identity_to_idx: dict {identity_str: int}
+        spectrum_files: dict {spectrum: [(path, identity_str), ...]}
+    """
+    spectrum_files = defaultdict(list)
+    all_identities = set()
+
+    for fname in sorted(os.listdir(data_dir)):
+        if not fname.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp')):
+            continue
+        identity, spectrum, _ = _parse_casia_filename(fname)
+        if identity is None:
+            continue
+        all_identities.add(identity)
+        spectrum_files[spectrum].append(
+            (os.path.join(data_dir, fname), identity))
+
+    identity_to_idx = {ident: idx
+                       for idx, ident in enumerate(sorted(all_identities))}
+
+    return identity_to_idx, dict(spectrum_files)
+
+
 class CASIAMSDataset(Dataset):
-    """CASIA Multi-Spectral palmprint dataset for a single spectrum."""
+    """CASIA-MS dataset for a single spectrum with global identity labels."""
 
-    def __init__(self, root, spectrum, transform=None):
-        self.root = root
-        self.spectrum = spectrum
+    def __init__(self, file_list, identity_to_idx, transform=None):
+        """
+        file_list: [(path, identity_str), ...]
+        identity_to_idx: global mapping {identity_str: int}
+        """
         self.transform = transform
-        self.samples = []
-        self.identities = []
-        self.identity_to_idx = {}
-
-        identity_samples = defaultdict(list)
-        for fname in sorted(os.listdir(root)):
-            if not fname.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp')):
-                continue
-            identity, spec, _ = _parse_casia_filename(fname)
-            if identity is None or spec != spectrum:
-                continue
-            identity_samples[identity].append(os.path.join(root, fname))
-
-        self.identities = sorted(identity_samples.keys())
-        self.identity_to_idx = {ident: idx
-                                for idx, ident in enumerate(self.identities)}
-
-        for ident in self.identities:
-            for fpath in identity_samples[ident]:
-                self.samples.append((fpath, self.identity_to_idx[ident]))
+        self.samples = [(path, identity_to_idx[ident])
+                        for path, ident in file_list
+                        if ident in identity_to_idx]
+        self.identity_to_idx = identity_to_idx
 
     def __len__(self):
         return len(self.samples)
@@ -134,18 +148,124 @@ class CASIAMSDataset(Dataset):
 
     @property
     def num_identities(self):
-        return len(self.identities)
+        labels = set(label for _, label in self.samples)
+        return len(labels)
 
 
+class CASIAMSTrainDataset(Dataset):
+    """
+    Combined multi-spectrum dataset for ArcFace training.
+    Includes augmentation.
+    """
+    def __init__(self, file_lists, identity_to_idx, img_size=112):
+        """
+        file_lists: dict {spectrum: [(path, identity_str), ...]}
+        """
+        self.identity_to_idx = identity_to_idx
+        self.samples = []
+        for spectrum, files in file_lists.items():
+            for path, ident in files:
+                if ident in identity_to_idx:
+                    self.samples.append((path, identity_to_idx[ident]))
+
+        self.transform = transforms.Compose([
+            transforms.Resize((img_size, img_size)),
+            transforms.RandomChoice([
+                transforms.ColorJitter(brightness=0, contrast=0.05),
+                transforms.RandomResizedCrop(img_size, scale=(0.85, 1.0),
+                                             ratio=(1.0, 1.0)),
+                transforms.RandomPerspective(distortion_scale=0.1, p=1),
+                transforms.RandomRotation(8),
+            ]),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+        ])
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        path, label = self.samples[idx]
+        img = Image.open(path).convert("RGB")
+        return self.transform(img), label
+
+    @property
+    def num_identities(self):
+        return len(set(label for _, label in self.samples))
+
+
+def get_casia_ms_train_test(data_dir, train_spectrums, batch_size=64,
+                             num_workers=4, img_size=112):
+    """
+    Build train and test datasets/loaders for CASIA-MS.
+
+    All identities appear in BOTH train and test.
+    Train spectrums: used for ArcFace head training (with augmentation).
+    Test spectrums: everything else (for evaluation + TENT).
+
+    Returns:
+        identity_to_idx: global identity mapping
+        num_identities: total identity count
+        train_loader: DataLoader for training (combined train spectrums)
+        test_loaders: list of (spectrum_name, DataLoader, CASIAMSDataset)
+    """
+    identity_to_idx, spectrum_files = build_global_identity_map(data_dir)
+    num_identities = len(identity_to_idx)
+
+    all_spectrums = sorted(spectrum_files.keys())
+    test_spectrums = [s for s in all_spectrums if s not in train_spectrums]
+
+    print(f"[CASIA-MS] {num_identities} identities across "
+          f"{len(all_spectrums)} spectrums")
+    print(f"  Train spectrums: {train_spectrums}")
+    print(f"  Test spectrums:  {test_spectrums}")
+
+    # ── Train dataset (combined train spectrums, with augmentation) ──
+    train_files = {s: spectrum_files[s] for s in train_spectrums
+                   if s in spectrum_files}
+    train_ds = CASIAMSTrainDataset(train_files, identity_to_idx, img_size)
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
+                              num_workers=num_workers, pin_memory=True,
+                              drop_last=True)
+
+    total_train = len(train_ds)
+    for s in train_spectrums:
+        n = len(spectrum_files.get(s, []))
+        print(f"    {s}: {n} samples")
+    print(f"    Total train: {total_train}")
+
+    # ── Test datasets (per-spectrum, no augmentation) ──
+    eval_transform = transforms.Compose([
+        transforms.Resize((img_size, img_size)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+    ])
+
+    test_loaders = []
+    for spectrum in test_spectrums:
+        if spectrum not in spectrum_files:
+            print(f"  [WARN] No files for test spectrum '{spectrum}'")
+            continue
+        ds = CASIAMSDataset(spectrum_files[spectrum], identity_to_idx,
+                            transform=eval_transform)
+        loader = DataLoader(ds, batch_size=batch_size, shuffle=True,
+                            num_workers=num_workers, pin_memory=True,
+                            drop_last=False)
+        test_loaders.append((spectrum, loader, ds))
+        print(f"    {spectrum}: {len(ds)} samples, "
+              f"{ds.num_identities} IDs in this spectrum")
+
+    return identity_to_idx, num_identities, train_loader, test_loaders
+
+
+# For backward compat — single-spectrum loaders
 def get_casia_ms_loaders(data_dir, batch_size=64, num_workers=4,
                           img_size=112, spectrums=None):
-    """
-    Returns list of (spectrum_name, DataLoader, CASIAMSDataset).
-    ArcFace convention: 112×112, mean=0.5, std=0.5.
-    """
-    run_spectrums = spectrums if spectrums else CASIA_MS_SPECTRUMS
+    """Returns list of (spectrum_name, DataLoader, CASIAMSDataset)."""
+    identity_to_idx, spectrum_files = build_global_identity_map(data_dir)
+    run_spectrums = spectrums if spectrums else sorted(spectrum_files.keys())
 
-    transform = transforms.Compose([
+    eval_transform = transforms.Compose([
         transforms.Resize((img_size, img_size)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
@@ -153,9 +273,11 @@ def get_casia_ms_loaders(data_dir, batch_size=64, num_workers=4,
 
     loaders = []
     for spectrum in run_spectrums:
-        ds = CASIAMSDataset(data_dir, spectrum, transform=transform)
+        if spectrum not in spectrum_files:
+            continue
+        ds = CASIAMSDataset(spectrum_files[spectrum], identity_to_idx,
+                            transform=eval_transform)
         if len(ds) == 0:
-            print(f"[WARN] No samples for spectrum '{spectrum}' in {data_dir}")
             continue
         loader = DataLoader(ds, batch_size=batch_size, shuffle=True,
                             num_workers=num_workers, pin_memory=True,

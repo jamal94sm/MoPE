@@ -58,7 +58,8 @@ def get_imagenet_c_sequence(data_dir, severity=5, batch_size=50,
         run_corruptions = corruptions
     else:
         run_corruptions = IMAGENET_C_CORRUPTIONS
-
+      
+    '''
     transform = transforms.Compose([
         transforms.Resize(256),
         transforms.CenterCrop(img_size),
@@ -66,6 +67,11 @@ def get_imagenet_c_sequence(data_dir, severity=5, batch_size=50,
         transforms.Normalize(mean=[0.485, 0.456, 0.406],
                              std=[0.229, 0.224, 0.225]),
     ])
+    '''
+                              
+    model = timm.create_model(backbone_name, pretrained=False)
+    data_cfg = timm.data.resolve_model_data_config(model)
+    transform = timm.data.create_transform(**data_cfg, is_training=False)
 
     loaders = []
     for corruption in run_corruptions:

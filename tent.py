@@ -392,7 +392,8 @@ class ContrastiveTent(nn.Module):
             info["entropy"] = ent_loss.item()
 
         con_loss = nt_xent_loss(z_orig, z_aug, self.contrastive_temp)
-        total_loss = total_loss + self.contrastive_lambda * con_loss
+        #total_loss = total_loss + self.contrastive_lambda * con_loss
+        total_loss = con_loss
         info["contrastive"] = con_loss.item()
         info["total"] = total_loss.item()
 

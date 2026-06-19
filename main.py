@@ -224,19 +224,18 @@ def adapt_imagenet_c(cfg):
 # ══════════════════════════════════════════════════════════════
 
 def adapt_casia_ms(cfg):
+    method_label = cfg.tta_method.upper()
     print(f"\n{'='*80}")
-    print(f"  TENT — CASIA-MS Palmprint Verification (Open-Set)")
-    print(f"  Backbone: ArcFace iResNet100")
+    print(f"  TTA — CASIA-MS Palmprint Verification (Open-Set)")
+    print(f"  Backbone: ArcFace iResNet100 | Method: {method_label}")
     print(f"  ID split: {100*(1-cfg.test_id_ratio):.0f}% train / "
           f"{100*cfg.test_id_ratio:.0f}% test")
     print(f"  Phase 1: Train backbone ({100*(1-cfg.arcface_freeze_ratio):.0f}%)"
           f" + head_A ({cfg.arcface_epochs} ep)")
-    print(f"  Phase 2: Train head_B on source domain "
-          f"({cfg.arcface_head_epochs} ep)")
-    print(f"  Phase 3-5: Eval → {cfg.tta_method.upper()} → Eval on target domain")
+    print(f"  Phase 2: Train head_B ({cfg.arcface_head_epochs} ep, "
+          f"LR={cfg.arcface_lr_phase2}, m={cfg.arcface_m_phase2})")
+    print(f"  Phase 4: {method_label} on target domains")
     print(f"  Gallery ratio: {cfg.gallery_ratio}")
-    if cfg.oracle_domains:
-        print(f"  TENT grouping: ORACLE (3 groups)")
     print(f"{'='*80}\n")
 
     os.makedirs(cfg.output_dir, exist_ok=True)
@@ -252,7 +251,7 @@ def adapt_casia_ms(cfg):
     n_test_cls = len(test_id_map)
 
     # ══════════════════════════════════════════════════════════
-    #  PHASE 1: Train backbone + head_A on train_spectrums × train_IDs
+    #  PHASE 1: Train backbone + head_A
     # ══════════════════════════════════════════════════════════
     print(f"\n{'─'*70}")
     print(f"  PHASE 1: Train backbone + train-ID head ({n_train_cls} classes)")
@@ -263,7 +262,6 @@ def adapt_casia_ms(cfg):
     cfg.arcface_num_classes = n_train_cls
     model = build_model(cfg)
 
-    # Trainable: unfrozen backbone + head_A
     train_params = ([p for p in model.backbone.parameters() if p.requires_grad]
                     + list(model.head.parameters()))
     n_unfrozen = sum(1 for p in model.backbone.parameters() if p.requires_grad)
@@ -274,35 +272,30 @@ def adapt_casia_ms(cfg):
     train_arcface(model, backbone_train_loader, train_params, cfg,
                   cfg.arcface_epochs, "P1", ckpt_path=ckpt1)
 
-    # Load best backbone weights
     if os.path.exists(ckpt1):
         ckpt = torch.load(ckpt1, map_location=cfg.device, weights_only=False)
         model.backbone.load_state_dict(ckpt["backbone"])
         print(f"\n  Loaded best Phase 1 backbone (epoch {ckpt['epoch']}, "
-              f"train Rank-1={ckpt['rank1']:.2f}%)")
+              f"Rank-1={ckpt['rank1']:.2f}%)")
 
     # ══════════════════════════════════════════════════════════
-    #  PHASE 2: Head training (method-dependent)
+    #  PHASE 2: Train head_B for test IDs (tent & contrastive)
+    #           BNA skips this phase
     # ══════════════════════════════════════════════════════════
+    model.backbone.requires_grad_(False)
 
-    # Save head_A for tent_headA method
-    import copy
-    head_A_state = copy.deepcopy(model.head.state_dict())
-    head_A_num_classes = n_train_cls
-
-    if cfg.tta_method == "tent":
-        # Train head_B for test IDs on source domain
+    if cfg.tta_method in ("tent", "contrastive"):
         print(f"\n{'─'*70}")
         print(f"  PHASE 2: Train test-ID head ({n_test_cls} classes)")
         print(f"  Source domain: {cfg.train_spectrums}")
         print(f"  {len(test_head_train_loader.dataset)} samples, "
-              f"{cfg.arcface_head_epochs} epochs")
+              f"{cfg.arcface_head_epochs} epochs, LR={cfg.arcface_lr_phase2}")
         print(f"  Backbone: FROZEN")
         print(f"{'─'*70}")
 
-        model.backbone.requires_grad_(False)
         head_B = ArcFaceHead(n_test_cls, embedding_size=512,
-                              s=cfg.arcface_s, m=cfg.arcface_m_phase2).to(cfg.device)
+                              s=cfg.arcface_s, m=cfg.arcface_m_phase2
+                              ).to(cfg.device)
         model.head = head_B
 
         head_params = list(model.head.parameters())
@@ -321,40 +314,27 @@ def adapt_casia_ms(cfg):
             model.head.load_state_dict(ckpt["head"])
             print(f"\n  Loaded best Phase 2 head (epoch {ckpt['epoch']}, "
                   f"Rank-1={ckpt['rank1']:.2f}%)")
-
-    elif cfg.tta_method == "tent_headA":
-        # Keep head_A — no Phase 2 training needed
+    else:
         print(f"\n{'─'*70}")
-        print(f"  PHASE 2: SKIPPED (using head_A with {head_A_num_classes} "
-              f"train-ID classes for entropy)")
+        print(f"  PHASE 2: SKIPPED (BNA needs no classification head)")
         print(f"{'─'*70}")
-        model.backbone.requires_grad_(False)
-
-    elif cfg.tta_method == "bna":
-        # No head needed — skip Phase 2
-        print(f"\n{'─'*70}")
-        print(f"  PHASE 2: SKIPPED (BNA does not require a classification head)")
-        print(f"{'─'*70}")
-        model.backbone.requires_grad_(False)
 
     # ══════════════════════════════════════════════════════════
-    #  PHASE 3: Pre-TTA baseline on target domains
+    #  PHASE 3: Pre-TTA baseline
     # ══════════════════════════════════════════════════════════
     print(f"\n{'─'*70}")
     print(f"  PHASE 3: Pre-TTA Baseline on Target Domains")
     print(f"{'─'*70}")
-    baseline = eval_test_spectrums(model, test_loaders, cfg,
-                                    tag="[pre-TTA] ")
+    baseline = eval_test_spectrums(model, test_loaders, cfg, tag="[pre-TTA] ")
 
     # ══════════════════════════════════════════════════════════
-    #  PHASE 4: TTA on test_spectrums × test_IDs
+    #  PHASE 4: TTA adaptation
     # ══════════════════════════════════════════════════════════
-    method_label = cfg.tta_method.upper()
     print(f"\n{'─'*70}")
-    print(f"  PHASE 4: {method_label} Adaptation on Target Domains")
+    print(f"  PHASE 4: {method_label} on Target Domains")
     print(f"{'─'*70}")
 
-    # Build domain sequence (oracle grouping or per-spectrum)
+    # Build domain sequence
     if cfg.oracle_domains:
         from collections import OrderedDict
         groups = OrderedDict()
@@ -363,66 +343,93 @@ def adapt_casia_ms(cfg):
             if gid not in groups:
                 groups[gid] = {"name": gn, "spectrums": []}
             groups[gid]["spectrums"].append((sn, ld, ds))
-        dom_seq = [(g["name"], gi, g["spectrums"]) for gi, g in groups.items()]
+        dom_seq = [(g["name"], gi, g["spectrums"])
+                   for gi, g in groups.items()]
     else:
         dom_seq = [(s, i, [(s, ld, ds)])
                    for i, (s, ld, ds) in enumerate(test_loaders)]
 
-    if cfg.tta_method in ("tent", "tent_headA"):
-        # TENT: entropy minimization on BN affine params
+    # ── TENT ──
+    if cfg.tta_method == "tent":
         model = tent.configure_model(model)
         tent.check_model(model)
         params, _ = tent.collect_params(model)
-        tent_opt = torch.optim.Adam(params, lr=cfg.tent_lr)
-        tented = tent.Tent(model, tent_opt, steps=cfg.tent_steps,
-                            episodic=cfg.tent_episodic)
-
-        head_info = ("head_B (test-ID)" if cfg.tta_method == "tent"
-                     else f"head_A (train-ID, {head_A_num_classes} classes)")
-        print(f"[{method_label}] {len(params)} BN params "
+        opt = torch.optim.Adam(params, lr=cfg.tent_lr)
+        tented = tent.Tent(model, opt, steps=cfg.tent_steps,
+                           episodic=cfg.tent_episodic)
+        print(f"[TENT] {len(params)} BN params "
               f"({sum(p.numel() for p in params)} values)")
-        print(f"[{method_label}] Entropy from: {head_info}")
+        print(f"[TENT] Entropy from: head_B ({n_test_cls} classes)")
 
         for di, (dn, _, slist) in enumerate(dom_seq):
             if cfg.tent_episodic: tented.reset()
             tb = sum(len(l) for _, l, _ in slist)
-            snames = [s for s, _, _ in slist]
             t0 = time.time()
-
-            print(f"\n  [{di+1}/{len(dom_seq)}] {dn} ({snames})")
+            print(f"\n  [{di+1}/{len(dom_seq)}] {dn} "
+                  f"({[s for s,_,_ in slist]})")
             print(f"  {'bat':>5} │{'spec':>6} │{'H':>6}")
-
             gb = 0
-            for sn, ld, ds in slist:
-                for bi, (imgs, labs) in enumerate(ld):
-                    imgs = imgs.to(cfg.device)
-                    logits = tented(imgs)
+            for sn, ld, _ in slist:
+                for imgs, _ in ld:
+                    logits = tented(imgs.to(cfg.device))
                     if gb < 5 or gb % 50 == 0 or gb == tb - 1:
                         H = tent.softmax_entropy(logits).mean().item()
                         print(f"  {gb:5d} │{sn:>6s} │{H:6.3f}")
                     gb += 1
-
             print(f"  Time: {time.time()-t0:.1f}s")
 
-    elif cfg.tta_method == "bna":
-        # BNA: just forward pass to update BN running stats
-        model = tent.configure_model_bna(model)
-        print(f"[BNA] BN running stats reset. Adapting via forward pass...")
+    # ── CONTRASTIVE: entropy(head_B) + NT-Xent ──
+    elif cfg.tta_method == "contrastive":
+        model = tent.configure_model(model)
+        tent.check_model(model)
+        params, _ = tent.collect_params(model)
+        opt = torch.optim.Adam(params, lr=cfg.tent_lr)
+        aug_tf = tent.get_tta_augmentation(cfg.img_size)
+        con = tent.ContrastiveTent(
+            model, opt, aug_tf,
+            contrastive_lambda=cfg.contrastive_lambda,
+            contrastive_temp=cfg.contrastive_temp,
+            steps=cfg.tent_steps, episodic=cfg.tent_episodic,
+            use_entropy=True)
+        print(f"[CONTRASTIVE] {len(params)} BN params "
+              f"({sum(p.numel() for p in params)} values)")
+        print(f"[CONTRASTIVE] Entropy from: head_B ({n_test_cls} classes)")
+        print(f"[CONTRASTIVE] λ={cfg.contrastive_lambda}, "
+              f"τ={cfg.contrastive_temp}")
 
         for di, (dn, _, slist) in enumerate(dom_seq):
+            if cfg.tent_episodic: con.reset()
             tb = sum(len(l) for _, l, _ in slist)
-            snames = [s for s, _, _ in slist]
             t0 = time.time()
-
-            print(f"\n  [{di+1}/{len(dom_seq)}] {dn} ({snames})")
-
+            print(f"\n  [{di+1}/{len(dom_seq)}] {dn} "
+                  f"({[s for s,_,_ in slist]})")
+            print(f"  {'bat':>5} │{'spec':>6} │{'H':>6} │"
+                  f"{'con':>6} │{'total':>6}")
             gb = 0
-            for sn, ld, ds in slist:
-                for bi, (imgs, labs) in enumerate(ld):
-                    imgs = imgs.to(cfg.device)
-                    tent.forward_bna(imgs, model)
+            for sn, ld, _ in slist:
+                for imgs, _ in ld:
+                    logits, info = con(imgs.to(cfg.device))
+                    if gb < 5 or gb % 50 == 0 or gb == tb - 1:
+                        print(f"  {gb:5d} │{sn:>6s} │"
+                              f"{info.get('entropy',0):6.3f} │"
+                              f"{info.get('contrastive',0):6.3f} │"
+                              f"{info.get('total',0):6.3f}")
                     gb += 1
+            print(f"  Time: {time.time()-t0:.1f}s")
 
+    # ── BNA ──
+    elif cfg.tta_method == "bna":
+        model = tent.configure_model_bna(model)
+        print(f"[BNA] BN running stats reset. Adapting via forward pass...")
+        for di, (dn, _, slist) in enumerate(dom_seq):
+            t0 = time.time()
+            print(f"\n  [{di+1}/{len(dom_seq)}] {dn} "
+                  f"({[s for s,_,_ in slist]})")
+            gb = 0
+            for sn, ld, _ in slist:
+                for imgs, _ in ld:
+                    tent.forward_bna(imgs.to(cfg.device), model)
+                    gb += 1
             print(f"  {gb} batches | Time: {time.time()-t0:.1f}s")
 
     # ══════════════════════════════════════════════════════════
@@ -435,14 +442,12 @@ def adapt_casia_ms(cfg):
     post_tta = eval_test_spectrums(model, test_loaders, cfg,
                                     tag=f"[post-{method_label}] ")
 
-    # ══════════════════════════════════════════════════════════
-    #  Final comparison table
-    # ══════════════════════════════════════════════════════════
+    # ── Final comparison ──
     print(f"\n{'='*80}")
-    print(f"  FINAL COMPARISON")
+    print(f"  FINAL COMPARISON ({method_label})")
     print(f"  Train IDs: {n_train_cls} | Test IDs: {n_test_cls}")
     print(f"  Source: {cfg.train_spectrums} | Target: "
-          f"{[s for s, _, _ in test_loaders]}")
+          f"{[s for s,_,_ in test_loaders]}")
     print(f"{'='*80}")
     print(f"\n  {'Spectrum':<10} {'Pre EER':>9} {'Pre R1':>8} "
           f"{'Post EER':>9} {'Post R1':>8} {'ΔEER':>8} {'ΔR1':>8}")
@@ -459,7 +464,6 @@ def adapt_casia_ms(cfg):
 
     def _m(d, k):
         return np.mean([r[k] for r in d.values()]) if d else -1
-
     be = _m(baseline, 'eer'); br = _m(baseline, 'rank1')
     te = _m(post_tta, 'eer'); tr = _m(post_tta, 'rank1')
     de = be - te; dr = tr - br
@@ -469,18 +473,13 @@ def adapt_casia_ms(cfg):
           f"{'↓' if de > 0 else '↑'}{abs(de):>6.2f}% "
           f"{'↑' if dr > 0 else '↓'}{abs(dr):>6.2f}%")
 
-    # Save
     save_data = {
-        "baseline": {k: dict(v) for k, v in baseline.items()},
+        "tta_method": cfg.tta_method, "baseline": {k: dict(v) for k, v in baseline.items()},
         "post_tta": {k: dict(v) for k, v in post_tta.items()},
         "n_train_ids": n_train_cls, "n_test_ids": n_test_cls,
         "train_spectrums": cfg.train_spectrums,
-        "test_id_ratio": cfg.test_id_ratio,
-        "arcface_epochs": cfg.arcface_epochs,
-        "arcface_head_epochs": cfg.arcface_head_epochs,
-        "tent_lr": cfg.tent_lr,
     }
-    p = os.path.join(cfg.output_dir, f"casia_ms_openset_seed{cfg.seed}.json")
+    p = os.path.join(cfg.output_dir, f"casia_{cfg.tta_method}_seed{cfg.seed}.json")
     with open(p, "w") as f:
         json.dump(save_data, f, indent=2)
     print(f"\n  Saved: {p}")

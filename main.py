@@ -315,7 +315,7 @@ def adapt_casia_ms(cfg):
             print(f"\n  Loaded best Phase 2 head (epoch {ckpt['epoch']}, "
                   f"Rank-1={ckpt['rank1']:.2f}%)")
     else:
-        # bna and contrastive_fim need no head
+        # bna, contrastive_fim, fim need no head
         print(f"\n{'─'*70}")
         print(f"  PHASE 2: SKIPPED ({method_label} needs no classification head)")
         print(f"{'─'*70}")
@@ -415,6 +415,39 @@ def adapt_casia_ms(cfg):
                         print(f"  {gb:5d} │{sn:>6s} │"
                               f"{info.get('entropy',0):6.3f} │"
                               f"{info.get('contrastive',0):6.3f} │"
+                              f"{info.get('total',0):6.3f}")
+                    gb += 1
+            print(f"  Time: {time.time()-t0:.1f}s")
+
+    # ── FIM only (no head, no augmentation) ──
+    elif cfg.tta_method == "fim":
+        model = tent.configure_model(model)
+        tent.check_model(model)
+        params, _ = tent.collect_params(model)
+        opt = torch.optim.Adam(params, lr=cfg.tent_lr)
+        fim = tent.FIM(
+            model, opt,
+            fim_lambda=cfg.fim_lambda, fim_temp=cfg.fim_temp,
+            steps=cfg.tent_steps, episodic=cfg.tent_episodic)
+        print(f"[FIM] {len(params)} BN params "
+              f"({sum(p.numel() for p in params)} values)")
+        print(f"[FIM] λ={cfg.fim_lambda}, τ={cfg.fim_temp}")
+        print(f"[FIM] No classification head, no augmentation")
+
+        for di, (dn, _, slist) in enumerate(dom_seq):
+            if cfg.tent_episodic: fim.reset()
+            tb = sum(len(l) for _, l, _ in slist)
+            t0 = time.time()
+            print(f"\n  [{di+1}/{len(dom_seq)}] {dn} "
+                  f"({[s for s,_,_ in slist]})")
+            print(f"  {'bat':>5} │{'spec':>6} │{'fim':>6} │{'total':>6}")
+            gb = 0
+            for sn, ld, _ in slist:
+                for imgs, _ in ld:
+                    _, info = fim(imgs.to(cfg.device))
+                    if gb < 5 or gb % 50 == 0 or gb == tb - 1:
+                        print(f"  {gb:5d} │{sn:>6s} │"
+                              f"{info.get('fim',0):6.3f} │"
                               f"{info.get('total',0):6.3f}")
                     gb += 1
             print(f"  Time: {time.time()-t0:.1f}s")

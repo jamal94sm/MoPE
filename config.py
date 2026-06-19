@@ -45,7 +45,7 @@ def get_cfg(args=None):
     p.add_argument("--num_workers", type=int, default=4)
 
     # ─── CASIA-MS specific ────────────────────────────────────
-    p.add_argument("--train_spectrums", nargs="*", default=["WHT", "940"],
+    p.add_argument("--train_spectrums", nargs="*", default=["WHT"],
                    help="Spectrums for training (source domain). "
                         "Test spectrums = all remaining (target domain).")
     p.add_argument("--test_id_ratio", type=float, default=0.2,

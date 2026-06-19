@@ -152,3 +152,35 @@ def check_model(model):
     has_bn = any(isinstance(m, (nn.BatchNorm2d, nn.BatchNorm1d))
                  for m in model.modules())
     assert has_bn, "tent needs normalization for its optimization"
+
+
+# ══════════════════════════════════════════════════════════════
+#  BNA: Batch Norm Adaptation (no gradients, no head)
+# ══════════════════════════════════════════════════════════════
+
+def configure_model_bna(model):
+    """
+    Configure model for BNA (Batch Norm Adaptation).
+
+    1. Set model to eval mode
+    2. Reset BN running stats
+    3. Set BN to train mode (use batch stats + update running stats)
+    4. Freeze all parameters (no gradients at all)
+    """
+    model.eval()
+    model.requires_grad_(False)
+
+    for m in model.modules():
+        if isinstance(m, (nn.BatchNorm2d, nn.BatchNorm1d)):
+            m.running_mean.zero_()
+            m.running_var.fill_(1.0)
+            m.num_batches_tracked.zero_()
+            m.train()  # use batch stats + accumulate into running stats
+
+    return model
+
+
+@torch.no_grad()
+def forward_bna(x, model):
+    """Forward pass for BNA. No gradients, just updates BN running stats."""
+    return model(x)

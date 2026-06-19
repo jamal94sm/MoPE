@@ -194,47 +194,108 @@ class CASIAMSTrainDataset(Dataset):
         return len(set(label for _, label in self.samples))
 
 
-def get_casia_ms_train_test(data_dir, train_spectrums, batch_size=64,
-                             num_workers=4, img_size=112):
+def split_identities(identity_to_idx, test_id_ratio=0.2, seed=2025):
     """
-    Build train and test datasets/loaders for CASIA-MS.
-
-    All identities appear in BOTH train and test.
-    Train spectrums: used for ArcFace head training (with augmentation).
-    Test spectrums: everything else (for evaluation + TENT).
+    Split identities into train and test groups.
 
     Returns:
-        identity_to_idx: global identity mapping
-        num_identities: total identity count
-        train_loader: DataLoader for training (combined train spectrums)
-        test_loaders: list of (spectrum_name, DataLoader, CASIAMSDataset)
+        train_ids: set of identity strings for training
+        test_ids: set of identity strings for testing
+        train_id_map: {identity_str: 0..N_train-1} for train ArcFace head
+        test_id_map: {identity_str: 0..N_test-1} for test ArcFace head
     """
-    identity_to_idx, spectrum_files = build_global_identity_map(data_dir)
-    num_identities = len(identity_to_idx)
+    rng = np.random.RandomState(seed)
+    all_ids = sorted(identity_to_idx.keys())
+    rng.shuffle(all_ids)
+
+    n_test = max(1, int(len(all_ids) * test_id_ratio))
+    test_ids = set(all_ids[:n_test])
+    train_ids = set(all_ids[n_test:])
+
+    train_id_map = {ident: idx
+                    for idx, ident in enumerate(sorted(train_ids))}
+    test_id_map = {ident: idx
+                   for idx, ident in enumerate(sorted(test_ids))}
+
+    return train_ids, test_ids, train_id_map, test_id_map
+
+
+def get_casia_ms_train_test(data_dir, train_spectrums, batch_size=64,
+                             num_workers=4, img_size=112,
+                             test_id_ratio=0.2, seed=2025):
+    """
+    Build all data splits for CASIA-MS open-set TENT pipeline.
+
+    ID split:
+      - train_ids (80%): used to train backbone + train-ID head
+      - test_ids  (20%): used for test-ID head, TENT, and evaluation
+
+    Spectrum split:
+      - train spectrums (source domain): WHT, 940
+      - test spectrums  (target domain): everything else
+
+    Returns:
+        train_ids, test_ids: sets of identity strings
+        train_id_map: {str: int} for train head (N_train classes)
+        test_id_map: {str: int} for test head (N_test classes)
+        backbone_train_loader: train_spectrums × train_ids (with augment)
+        test_head_train_loader: train_spectrums × test_ids (with augment)
+        test_loaders: [(spectrum, DataLoader, Dataset)] for
+                      test_spectrums × test_ids (no augment)
+    """
+    _, spectrum_files = build_global_identity_map(data_dir)
+    all_ids = set()
+    for files in spectrum_files.values():
+        all_ids.update(ident for _, ident in files)
+
+    # Build a global map just for splitting
+    global_map = {ident: idx for idx, ident in enumerate(sorted(all_ids))}
+
+    # Split identities
+    train_ids, test_ids, train_id_map, test_id_map = \
+        split_identities(global_map, test_id_ratio, seed)
 
     all_spectrums = sorted(spectrum_files.keys())
     test_spectrums = [s for s in all_spectrums if s not in train_spectrums]
 
-    print(f"[CASIA-MS] {num_identities} identities across "
-          f"{len(all_spectrums)} spectrums")
-    print(f"  Train spectrums: {train_spectrums}")
-    print(f"  Test spectrums:  {test_spectrums}")
+    n_train = len(train_ids); n_test = len(test_ids)
+    print(f"[CASIA-MS] {len(all_ids)} total identities: "
+          f"{n_train} train + {n_test} test")
+    print(f"  Train spectrums (source): {train_spectrums}")
+    print(f"  Test spectrums  (target): {test_spectrums}")
 
-    # ── Train dataset (combined train spectrums, with augmentation) ──
-    train_files = {s: spectrum_files[s] for s in train_spectrums
-                   if s in spectrum_files}
-    train_ds = CASIAMSTrainDataset(train_files, identity_to_idx, img_size)
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
-                              num_workers=num_workers, pin_memory=True,
-                              drop_last=True)
+    # ── Filter files by ID group ──
+    def filter_files(spectrum_list, id_set):
+        """Filter to keep only files whose identity is in id_set."""
+        return {s: [(p, ident) for p, ident in spectrum_files.get(s, [])
+                     if ident in id_set]
+                for s in spectrum_list}
 
-    total_train = len(train_ds)
-    for s in train_spectrums:
-        n = len(spectrum_files.get(s, []))
-        print(f"    {s}: {n} samples")
-    print(f"    Total train: {total_train}")
+    bb_train_files = filter_files(train_spectrums, train_ids)
+    test_head_files = filter_files(train_spectrums, test_ids)
+    test_eval_files = filter_files(test_spectrums, test_ids)
 
-    # ── Test datasets (per-spectrum, no augmentation) ──
+    # ── Backbone training: train_spectrums × train_ids ──
+    bb_train_ds = CASIAMSTrainDataset(bb_train_files, train_id_map, img_size)
+    backbone_train_loader = DataLoader(
+        bb_train_ds, batch_size=batch_size, shuffle=True,
+        num_workers=num_workers, pin_memory=True, drop_last=True)
+
+    bb_count = len(bb_train_ds)
+    print(f"  Backbone training: {bb_count} samples "
+          f"({n_train} IDs × {len(train_spectrums)} spectrums)")
+
+    # ── Test head training: train_spectrums × test_ids ──
+    th_train_ds = CASIAMSTrainDataset(test_head_files, test_id_map, img_size)
+    test_head_train_loader = DataLoader(
+        th_train_ds, batch_size=batch_size, shuffle=True,
+        num_workers=num_workers, pin_memory=True, drop_last=True)
+
+    th_count = len(th_train_ds)
+    print(f"  Test head training: {th_count} samples "
+          f"({n_test} IDs × {len(train_spectrums)} spectrums)")
+
+    # ── Test evaluation: test_spectrums × test_ids ──
     eval_transform = transforms.Compose([
         transforms.Resize((img_size, img_size)),
         transforms.ToTensor(),
@@ -243,19 +304,20 @@ def get_casia_ms_train_test(data_dir, train_spectrums, batch_size=64,
 
     test_loaders = []
     for spectrum in test_spectrums:
-        if spectrum not in spectrum_files:
-            print(f"  [WARN] No files for test spectrum '{spectrum}'")
+        files = test_eval_files.get(spectrum, [])
+        if not files:
+            print(f"  [WARN] No test-ID files for spectrum '{spectrum}'")
             continue
-        ds = CASIAMSDataset(spectrum_files[spectrum], identity_to_idx,
-                            transform=eval_transform)
+        ds = CASIAMSDataset(files, test_id_map, transform=eval_transform)
         loader = DataLoader(ds, batch_size=batch_size, shuffle=True,
                             num_workers=num_workers, pin_memory=True,
                             drop_last=False)
         test_loaders.append((spectrum, loader, ds))
-        print(f"    {spectrum}: {len(ds)} samples, "
-              f"{ds.num_identities} IDs in this spectrum")
+        print(f"  Test eval {spectrum}: {len(ds)} samples, "
+              f"{ds.num_identities} IDs")
 
-    return identity_to_idx, num_identities, train_loader, test_loaders
+    return (train_ids, test_ids, train_id_map, test_id_map,
+            backbone_train_loader, test_head_train_loader, test_loaders)
 
 
 # For backward compat — single-spectrum loaders

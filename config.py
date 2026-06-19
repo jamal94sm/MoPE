@@ -69,7 +69,7 @@ def get_cfg(args=None):
                    help="Weight decay for ArcFace training")
     p.add_argument("--arcface_eval_every", type=int, default=5,
                    help="Evaluate on test set every N epochs")
-    p.add_argument("--arcface_freeze_ratio", type=float, default=0.9,
+    p.add_argument("--arcface_freeze_ratio", type=float, default=0.75,
                    help="Fraction of backbone params to freeze during "
                         "Phase 1 training. 0.75 = finetune last 25%%.")
 

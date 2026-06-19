@@ -101,13 +101,14 @@ def get_cfg(args=None):
 
     # ─── TTA method & parameters ─────────────────────────────
     p.add_argument("--tta_method", default="tent",
-                   choices=["tent", "bna", "contrastive", "contrastive_fim"],
+                   choices=["tent", "bna", "contrastive",
+                            "contrastive_fim", "fim"],
                    help="TTA method: "
                         "'tent' = entropy min on head_B, "
                         "'bna' = batch norm adaptation (no head), "
                         "'contrastive' = entropy(head_B) + NT-Xent, "
-                        "'contrastive_fim' = NT-Xent + feature IM "
-                        "(no head needed)")
+                        "'contrastive_fim' = NT-Xent + feature IM (no head), "
+                        "'fim' = feature IM only (no head, no augmentation)")
     p.add_argument("--tent_lr", type=float, default=1e-3,
                    help="TENT learning rate for BN affine params")
     p.add_argument("--tent_steps", type=int, default=1,

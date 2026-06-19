@@ -315,8 +315,9 @@ def adapt_casia_ms(cfg):
             print(f"\n  Loaded best Phase 2 head (epoch {ckpt['epoch']}, "
                   f"Rank-1={ckpt['rank1']:.2f}%)")
     else:
+        # bna and contrastive_fim need no head
         print(f"\n{'─'*70}")
-        print(f"  PHASE 2: SKIPPED (BNA needs no classification head)")
+        print(f"  PHASE 2: SKIPPED ({method_label} needs no classification head)")
         print(f"{'─'*70}")
 
     # ══════════════════════════════════════════════════════════
@@ -390,7 +391,8 @@ def adapt_casia_ms(cfg):
             contrastive_lambda=cfg.contrastive_lambda,
             contrastive_temp=cfg.contrastive_temp,
             steps=cfg.tent_steps, episodic=cfg.tent_episodic,
-            use_entropy=True)
+            use_entropy=True,
+            use_fft=cfg.use_fft_aug, fft_beta=cfg.fft_beta)
         print(f"[CONTRASTIVE] {len(params)} BN params "
               f"({sum(p.numel() for p in params)} values)")
         print(f"[CONTRASTIVE] Entropy from: head_B ({n_test_cls} classes)")
@@ -431,6 +433,50 @@ def adapt_casia_ms(cfg):
                     tent.forward_bna(imgs.to(cfg.device), model)
                     gb += 1
             print(f"  {gb} batches | Time: {time.time()-t0:.1f}s")
+
+    # ── CONTRASTIVE + Feature IM (no head) ──
+    elif cfg.tta_method == "contrastive_fim":
+        model = tent.configure_model(model)
+        tent.check_model(model)
+        params, _ = tent.collect_params(model)
+        opt = torch.optim.Adam(params, lr=cfg.tent_lr)
+        aug_tf = tent.get_tta_augmentation(cfg.img_size)
+        cfim = tent.ContrastiveFIM(
+            model, opt, aug_tf,
+            contrastive_lambda=cfg.contrastive_lambda,
+            contrastive_temp=cfg.contrastive_temp,
+            fim_lambda=cfg.fim_lambda, fim_temp=cfg.fim_temp,
+            use_fft=cfg.use_fft_aug, fft_beta=cfg.fft_beta,
+            steps=cfg.tent_steps, episodic=cfg.tent_episodic)
+        print(f"[CONTRASTIVE_FIM] {len(params)} BN params "
+              f"({sum(p.numel() for p in params)} values)")
+        print(f"[CONTRASTIVE_FIM] λ_con={cfg.contrastive_lambda}, "
+              f"τ_con={cfg.contrastive_temp}")
+        print(f"[CONTRASTIVE_FIM] λ_fim={cfg.fim_lambda}, "
+              f"τ_fim={cfg.fim_temp}")
+        print(f"[CONTRASTIVE_FIM] FFT aug: {cfg.use_fft_aug}, "
+              f"β={cfg.fft_beta}")
+        print(f"[CONTRASTIVE_FIM] No classification head needed")
+
+        for di, (dn, _, slist) in enumerate(dom_seq):
+            if cfg.tent_episodic: cfim.reset()
+            tb = sum(len(l) for _, l, _ in slist)
+            t0 = time.time()
+            print(f"\n  [{di+1}/{len(dom_seq)}] {dn} "
+                  f"({[s for s,_,_ in slist]})")
+            print(f"  {'bat':>5} │{'spec':>6} │{'con':>6} │"
+                  f"{'fim':>6} │{'total':>6}")
+            gb = 0
+            for sn, ld, _ in slist:
+                for imgs, _ in ld:
+                    _, info = cfim(imgs.to(cfg.device))
+                    if gb < 5 or gb % 50 == 0 or gb == tb - 1:
+                        print(f"  {gb:5d} │{sn:>6s} │"
+                              f"{info.get('contrastive',0):6.3f} │"
+                              f"{info.get('fim',0):6.3f} │"
+                              f"{info.get('total',0):6.3f}")
+                    gb += 1
+            print(f"  Time: {time.time()-t0:.1f}s")
 
     # ══════════════════════════════════════════════════════════
     #  PHASE 5: Post-TTA eval

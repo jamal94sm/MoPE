@@ -45,18 +45,22 @@ def get_cfg(args=None):
     p.add_argument("--num_workers", type=int, default=4)
 
     # ─── CASIA-MS specific ────────────────────────────────────
-    p.add_argument("--train_spectrums", nargs="*", default=["940"],
-                   help="Spectrums for ArcFace head training. "
-                        "Test spectrums = all remaining spectrums.")
+    p.add_argument("--train_spectrums", nargs="*", default=["WHT", "940"],
+                   help="Spectrums for training (source domain). "
+                        "Test spectrums = all remaining (target domain).")
+    p.add_argument("--test_id_ratio", type=float, default=0.2,
+                   help="Fraction of identities held out for testing. "
+                        "0.2 = 20%% test IDs, 80%% train IDs.")
     p.add_argument("--gallery_ratio", type=float, default=0.1,
                    help="Fraction of samples per ID for gallery (rest=probe)")
     p.add_argument("--oracle_domains", action="store_true", default=False,
-                   help="Use oracle 3-group spectrum assignment instead of "
-                        "treating each spectrum as a separate domain")
+                   help="Use oracle 3-group spectrum assignment for TENT")
 
     # ─── ArcFace training ─────────────────────────────────────
-    p.add_argument("--arcface_epochs", type=int, default=1,
-                   help="Epochs to train ArcFace head on train spectrums")
+    p.add_argument("--arcface_epochs", type=int, default=50,
+                   help="Epochs to train backbone + train-ID head")
+    p.add_argument("--arcface_head_epochs", type=int, default=30,
+                   help="Epochs to train test-ID head (backbone frozen)")
     p.add_argument("--arcface_lr", type=float, default=1e-4,
                    help="Learning rate for ArcFace training")
     p.add_argument("--arcface_wd", type=float, default=5e-4,
@@ -64,10 +68,8 @@ def get_cfg(args=None):
     p.add_argument("--arcface_eval_every", type=int, default=5,
                    help="Evaluate on test set every N epochs")
     p.add_argument("--arcface_freeze_ratio", type=float, default=0.75,
-                   help="Fraction of backbone params to freeze during training. "
-                        "0.75 = freeze first 75%%, finetune last 25%%. "
-                        "1.0 = freeze all (head only — only works if backbone "
-                        "already produces good embeddings for your domain).")
+                   help="Fraction of backbone params to freeze during "
+                        "Phase 1 training. 0.75 = finetune last 25%%.")
 
     # ─── Backbone ─────────────────────────────────────────────
     p.add_argument("--backbone", default="vit_base",
@@ -122,3 +124,4 @@ def get_cfg(args=None):
         cfg.is_verification = False
 
     return cfg
+  

@@ -45,7 +45,7 @@ def get_cfg(args=None):
     p.add_argument("--num_workers", type=int, default=4)
 
     # ─── CASIA-MS specific ────────────────────────────────────
-    p.add_argument("--train_spectrums", nargs="*", default=["WHT"],
+    p.add_argument("--train_spectrums", nargs="*", default=["WHT", "940"],
                    help="Spectrums for training (source domain). "
                         "Test spectrums = all remaining (target domain).")
     p.add_argument("--test_id_ratio", type=float, default=0.2,
@@ -88,7 +88,11 @@ def get_cfg(args=None):
     p.add_argument("--arcface_s", type=float, default=64.0,
                    help="ArcFace scale factor")
     p.add_argument("--arcface_m", type=float, default=0.50,
-                   help="ArcFace angular margin")
+                   help="ArcFace angular margin for Phase 1 (backbone training)")
+    p.add_argument("--arcface_m_phase2", type=float, default=0.10,
+                   help="ArcFace angular margin for Phase 2 (test-ID head). "
+                        "Lower than Phase 1 since head trains on frozen backbone "
+                        "with fewer samples.")
     p.add_argument("--num_classes", type=int, default=1000,
                    help="Number of classes (ImageNet-C)")
     p.add_argument("--img_size", type=int, default=224)
@@ -124,4 +128,3 @@ def get_cfg(args=None):
         cfg.is_verification = False
 
     return cfg
-  

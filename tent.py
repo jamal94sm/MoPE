@@ -529,3 +529,59 @@ class ContrastiveFIM(nn.Module):
             raise Exception("cannot reset without saved state")
         load_model_and_optimizer(self.model, self.optimizer,
                                 self.model_state, self.optimizer_state)
+
+class FIM(nn.Module):
+    """
+    Feature Information Maximization only.
+
+    Loss = λ_fim * FeatureIM(z)
+
+    No augmentation, no contrastive, no classification head.
+    Just sharpen neighborhood clusters + prevent collapse.
+    """
+    def __init__(self, model, optimizer,
+                 fim_lambda=1.0, fim_temp=0.1,
+                 steps=1, episodic=False):
+        super().__init__()
+        self.model = model
+        self.optimizer = optimizer
+        self.fim_lambda = fim_lambda
+        self.fim_temp = fim_temp
+        self.steps = steps
+        self.episodic = episodic
+        assert steps > 0
+
+        self.model_state, self.optimizer_state = \
+            copy_model_and_optimizer(self.model, self.optimizer)
+
+    def _get_embeddings(self, x):
+        if hasattr(self.model, 'get_embeddings'):
+            return self.model.get_embeddings(x)
+        elif hasattr(self.model, 'backbone'):
+            return self.model.backbone(x)
+        else:
+            return self.model(x)
+
+    def forward(self, x):
+        if self.episodic:
+            self.reset()
+        for _ in range(self.steps):
+            outputs, info = self._adapt(x)
+        return outputs, info
+
+    @torch.enable_grad()
+    def _adapt(self, x):
+        z = self._get_embeddings(x)
+        fim = feature_im_loss(z, self.fim_temp)
+        total = self.fim_lambda * fim
+        info = {"fim": fim.item(), "total": total.item()}
+        total.backward()
+        self.optimizer.step()
+        self.optimizer.zero_grad()
+        return z.detach(), info
+
+    def reset(self):
+        if self.model_state is None or self.optimizer_state is None:
+            raise Exception("cannot reset without saved state")
+        load_model_and_optimizer(self.model, self.optimizer,
+                                self.model_state, self.optimizer_state)

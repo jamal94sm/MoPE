@@ -101,18 +101,22 @@ def get_cfg(args=None):
 
     # ─── TTA method & parameters ─────────────────────────────
     p.add_argument("--tta_method", default="tent",
-                   choices=["tent", "bna", "tent_headA"],
+                   choices=["tent", "bna", "contrastive"],
                    help="TTA method: "
-                        "'tent' = entropy min on head_B (test-ID head), "
-                        "'bna' = batch norm adaptation (no head needed), "
-                        "'tent_headA' = entropy min using frozen head_A "
-                        "(train-ID head, test IDs not in it)")
+                        "'tent' = entropy min on head_B, "
+                        "'bna' = batch norm adaptation (no head), "
+                        "'contrastive' = entropy(head_B) + NT-Xent "
+                        "on augmented embedding pairs")
     p.add_argument("--tent_lr", type=float, default=1e-3,
                    help="TENT learning rate for BN affine params")
     p.add_argument("--tent_steps", type=int, default=1,
                    help="Gradient steps per batch (1=online TENT)")
     p.add_argument("--tent_episodic", action="store_true", default=False,
                    help="Reset BN params after each domain/spectrum")
+    p.add_argument("--contrastive_lambda", type=float, default=1.0,
+                   help="Weight of contrastive loss vs entropy loss")
+    p.add_argument("--contrastive_temp", type=float, default=0.5,
+                   help="Temperature for NT-Xent contrastive loss")
 
     # ─── Evaluation ───────────────────────────────────────────
     p.add_argument("--eval_backbone", action="store_true", default=False,

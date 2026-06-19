@@ -62,7 +62,9 @@ def get_cfg(args=None):
     p.add_argument("--arcface_head_epochs", type=int, default=30,
                    help="Epochs to train test-ID head (backbone frozen)")
     p.add_argument("--arcface_lr", type=float, default=1e-4,
-                   help="Learning rate for ArcFace training")
+                   help="Learning rate for Phase 1 (backbone + head_A)")
+    p.add_argument("--arcface_lr_phase2", type=float, default=1e-2,
+                   help="Learning rate for Phase 2 (test-ID head only)")
     p.add_argument("--arcface_wd", type=float, default=5e-4,
                    help="Weight decay for ArcFace training")
     p.add_argument("--arcface_eval_every", type=int, default=5,

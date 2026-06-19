@@ -233,7 +233,7 @@ def adapt_casia_ms(cfg):
           f" + head_A ({cfg.arcface_epochs} ep)")
     print(f"  Phase 2: Train head_B on source domain "
           f"({cfg.arcface_head_epochs} ep)")
-    print(f"  Phase 3-5: Eval → TENT → Eval on target domain")
+    print(f"  Phase 3-5: Eval → {cfg.tta_method.upper()} → Eval on target domain")
     print(f"  Gallery ratio: {cfg.gallery_ratio}")
     if cfg.oracle_domains:
         print(f"  TENT grouping: ORACLE (3 groups)")
@@ -282,70 +282,79 @@ def adapt_casia_ms(cfg):
               f"train Rank-1={ckpt['rank1']:.2f}%)")
 
     # ══════════════════════════════════════════════════════════
-    #  PHASE 2: Replace head → head_B for test IDs
-    #           Train on train_spectrums × test_IDs (source domain)
+    #  PHASE 2: Head training (method-dependent)
+    # ══════════════════════════════════════════════════════════
+
+    # Save head_A for tent_headA method
+    import copy
+    head_A_state = copy.deepcopy(model.head.state_dict())
+    head_A_num_classes = n_train_cls
+
+    if cfg.tta_method == "tent":
+        # Train head_B for test IDs on source domain
+        print(f"\n{'─'*70}")
+        print(f"  PHASE 2: Train test-ID head ({n_test_cls} classes)")
+        print(f"  Source domain: {cfg.train_spectrums}")
+        print(f"  {len(test_head_train_loader.dataset)} samples, "
+              f"{cfg.arcface_head_epochs} epochs")
+        print(f"  Backbone: FROZEN")
+        print(f"{'─'*70}")
+
+        model.backbone.requires_grad_(False)
+        head_B = ArcFaceHead(n_test_cls, embedding_size=512,
+                              s=cfg.arcface_s, m=cfg.arcface_m_phase2).to(cfg.device)
+        model.head = head_B
+
+        head_params = list(model.head.parameters())
+        print(f"[Phase 2] Head_B: {n_test_cls} classes, "
+              f"{sum(p.numel() for p in head_params)} params, "
+              f"margin={cfg.arcface_m_phase2}")
+
+        ckpt2 = os.path.join(cfg.output_dir, "phase2_best.pth")
+        train_arcface(model, test_head_train_loader, head_params, cfg,
+                      cfg.arcface_head_epochs, "P2",
+                      test_loaders=test_loaders, ckpt_path=ckpt2,
+                      lr=cfg.arcface_lr_phase2)
+
+        if os.path.exists(ckpt2):
+            ckpt = torch.load(ckpt2, map_location=cfg.device, weights_only=False)
+            model.head.load_state_dict(ckpt["head"])
+            print(f"\n  Loaded best Phase 2 head (epoch {ckpt['epoch']}, "
+                  f"Rank-1={ckpt['rank1']:.2f}%)")
+
+    elif cfg.tta_method == "tent_headA":
+        # Keep head_A — no Phase 2 training needed
+        print(f"\n{'─'*70}")
+        print(f"  PHASE 2: SKIPPED (using head_A with {head_A_num_classes} "
+              f"train-ID classes for entropy)")
+        print(f"{'─'*70}")
+        model.backbone.requires_grad_(False)
+
+    elif cfg.tta_method == "bna":
+        # No head needed — skip Phase 2
+        print(f"\n{'─'*70}")
+        print(f"  PHASE 2: SKIPPED (BNA does not require a classification head)")
+        print(f"{'─'*70}")
+        model.backbone.requires_grad_(False)
+
+    # ══════════════════════════════════════════════════════════
+    #  PHASE 3: Pre-TTA baseline on target domains
     # ══════════════════════════════════════════════════════════
     print(f"\n{'─'*70}")
-    print(f"  PHASE 2: Train test-ID head ({n_test_cls} classes)")
-    print(f"  Source domain: {cfg.train_spectrums}")
-    print(f"  {len(test_head_train_loader.dataset)} samples, "
-          f"{cfg.arcface_head_epochs} epochs")
-    print(f"  Backbone: FROZEN")
-    print(f"{'─'*70}")
-
-    # Freeze entire backbone
-    model.backbone.requires_grad_(False)
-
-    # Replace head
-    head_B = ArcFaceHead(n_test_cls, embedding_size=512,
-                          s=cfg.arcface_s, m=cfg.arcface_m_phase2).to(cfg.device)
-    model.head = head_B
-
-    head_params = list(model.head.parameters())
-    print(f"[Phase 2] Head_B: {n_test_cls} classes, "
-          f"{sum(p.numel() for p in head_params)} params, "
-          f"margin={cfg.arcface_m_phase2}")
-
-    ckpt2 = os.path.join(cfg.output_dir, "phase2_best.pth")
-    train_arcface(model, test_head_train_loader, head_params, cfg,
-                  cfg.arcface_head_epochs, "P2",
-                  test_loaders=test_loaders, ckpt_path=ckpt2,
-                  lr=cfg.arcface_lr_phase2)
-
-    # Load best head_B
-    if os.path.exists(ckpt2):
-        ckpt = torch.load(ckpt2, map_location=cfg.device, weights_only=False)
-        model.head.load_state_dict(ckpt["head"])
-        print(f"\n  Loaded best Phase 2 head (epoch {ckpt['epoch']}, "
-              f"Rank-1={ckpt['rank1']:.2f}%)")
-
-    # ══════════════════════════════════════════════════════════
-    #  PHASE 3: Baseline eval on test_spectrums × test_IDs
-    # ══════════════════════════════════════════════════════════
-    print(f"\n{'─'*70}")
-    print(f"  PHASE 3: Pre-TENT Baseline on Target Domains")
+    print(f"  PHASE 3: Pre-TTA Baseline on Target Domains")
     print(f"{'─'*70}")
     baseline = eval_test_spectrums(model, test_loaders, cfg,
-                                    tag="[pre-TENT] ")
+                                    tag="[pre-TTA] ")
 
     # ══════════════════════════════════════════════════════════
-    #  PHASE 4: TENT on test_spectrums × test_IDs
+    #  PHASE 4: TTA on test_spectrums × test_IDs
     # ══════════════════════════════════════════════════════════
+    method_label = cfg.tta_method.upper()
     print(f"\n{'─'*70}")
-    print(f"  PHASE 4: TENT Adaptation on Target Domains")
+    print(f"  PHASE 4: {method_label} Adaptation on Target Domains")
     print(f"{'─'*70}")
 
-    model = tent.configure_model(model)
-    tent.check_model(model)
-    params, _ = tent.collect_params(model)
-    tent_opt = torch.optim.Adam(params, lr=cfg.tent_lr)
-    tented = tent.Tent(model, tent_opt, steps=cfg.tent_steps,
-                        episodic=cfg.tent_episodic)
-
-    print(f"[TENT] {len(params)} BN params "
-          f"({sum(p.numel() for p in params)} values)")
-
-    # Group by oracle domain if enabled
+    # Build domain sequence (oracle grouping or per-spectrum)
     if cfg.oracle_domains:
         from collections import OrderedDict
         groups = OrderedDict()
@@ -359,36 +368,72 @@ def adapt_casia_ms(cfg):
         dom_seq = [(s, i, [(s, ld, ds)])
                    for i, (s, ld, ds) in enumerate(test_loaders)]
 
-    for di, (dn, _, slist) in enumerate(dom_seq):
-        if cfg.tent_episodic: tented.reset()
-        tb = sum(len(l) for _, l, _ in slist)
-        snames = [s for s, _, _ in slist]
-        t0 = time.time()
+    if cfg.tta_method in ("tent", "tent_headA"):
+        # TENT: entropy minimization on BN affine params
+        model = tent.configure_model(model)
+        tent.check_model(model)
+        params, _ = tent.collect_params(model)
+        tent_opt = torch.optim.Adam(params, lr=cfg.tent_lr)
+        tented = tent.Tent(model, tent_opt, steps=cfg.tent_steps,
+                            episodic=cfg.tent_episodic)
 
-        print(f"\n  [{di+1}/{len(dom_seq)}] {dn} ({snames})")
-        print(f"  {'bat':>5} │{'spec':>6} │{'H':>6}")
+        head_info = ("head_B (test-ID)" if cfg.tta_method == "tent"
+                     else f"head_A (train-ID, {head_A_num_classes} classes)")
+        print(f"[{method_label}] {len(params)} BN params "
+              f"({sum(p.numel() for p in params)} values)")
+        print(f"[{method_label}] Entropy from: {head_info}")
 
-        gb = 0
-        for sn, ld, ds in slist:
-            for bi, (imgs, labs) in enumerate(ld):
-                imgs = imgs.to(cfg.device)
-                logits = tented(imgs)
-                if gb < 5 or gb % 50 == 0 or gb == tb - 1:
-                    H = tent.softmax_entropy(logits).mean().item()
-                    print(f"  {gb:5d} │{sn:>6s} │{H:6.3f}")
-                gb += 1
+        for di, (dn, _, slist) in enumerate(dom_seq):
+            if cfg.tent_episodic: tented.reset()
+            tb = sum(len(l) for _, l, _ in slist)
+            snames = [s for s, _, _ in slist]
+            t0 = time.time()
 
-        print(f"  Time: {time.time()-t0:.1f}s")
+            print(f"\n  [{di+1}/{len(dom_seq)}] {dn} ({snames})")
+            print(f"  {'bat':>5} │{'spec':>6} │{'H':>6}")
+
+            gb = 0
+            for sn, ld, ds in slist:
+                for bi, (imgs, labs) in enumerate(ld):
+                    imgs = imgs.to(cfg.device)
+                    logits = tented(imgs)
+                    if gb < 5 or gb % 50 == 0 or gb == tb - 1:
+                        H = tent.softmax_entropy(logits).mean().item()
+                        print(f"  {gb:5d} │{sn:>6s} │{H:6.3f}")
+                    gb += 1
+
+            print(f"  Time: {time.time()-t0:.1f}s")
+
+    elif cfg.tta_method == "bna":
+        # BNA: just forward pass to update BN running stats
+        model = tent.configure_model_bna(model)
+        print(f"[BNA] BN running stats reset. Adapting via forward pass...")
+
+        for di, (dn, _, slist) in enumerate(dom_seq):
+            tb = sum(len(l) for _, l, _ in slist)
+            snames = [s for s, _, _ in slist]
+            t0 = time.time()
+
+            print(f"\n  [{di+1}/{len(dom_seq)}] {dn} ({snames})")
+
+            gb = 0
+            for sn, ld, ds in slist:
+                for bi, (imgs, labs) in enumerate(ld):
+                    imgs = imgs.to(cfg.device)
+                    tent.forward_bna(imgs, model)
+                    gb += 1
+
+            print(f"  {gb} batches | Time: {time.time()-t0:.1f}s")
 
     # ══════════════════════════════════════════════════════════
-    #  PHASE 5: Post-TENT eval
+    #  PHASE 5: Post-TTA eval
     # ══════════════════════════════════════════════════════════
     print(f"\n{'─'*70}")
-    print(f"  PHASE 5: Post-TENT Evaluation")
+    print(f"  PHASE 5: Post-{method_label} Evaluation")
     print(f"{'─'*70}")
     model.eval()
-    post_tent = eval_test_spectrums(model, test_loaders, cfg,
-                                     tag="[post-TENT] ")
+    post_tta = eval_test_spectrums(model, test_loaders, cfg,
+                                    tag=f"[post-{method_label}] ")
 
     # ══════════════════════════════════════════════════════════
     #  Final comparison table
@@ -403,8 +448,8 @@ def adapt_casia_ms(cfg):
           f"{'Post EER':>9} {'Post R1':>8} {'ΔEER':>8} {'ΔR1':>8}")
     print(f"  {'─'*65}")
 
-    for sn in post_tent:
-        b = baseline.get(sn, {}); n = post_tent[sn]
+    for sn in post_tta:
+        b = baseline.get(sn, {}); n = post_tta[sn]
         de = b.get("eer", 0) - n["eer"]
         dr = n["rank1"] - b.get("rank1", 0)
         print(f"  {sn:<10} {b.get('eer',-1):>8.2f}% {b.get('rank1',-1):>7.2f}% "
@@ -416,7 +461,7 @@ def adapt_casia_ms(cfg):
         return np.mean([r[k] for r in d.values()]) if d else -1
 
     be = _m(baseline, 'eer'); br = _m(baseline, 'rank1')
-    te = _m(post_tent, 'eer'); tr = _m(post_tent, 'rank1')
+    te = _m(post_tta, 'eer'); tr = _m(post_tta, 'rank1')
     de = be - te; dr = tr - br
     print(f"  {'─'*65}")
     print(f"  {'MEAN':<10} {be:>8.2f}% {br:>7.2f}% "
@@ -427,7 +472,7 @@ def adapt_casia_ms(cfg):
     # Save
     save_data = {
         "baseline": {k: dict(v) for k, v in baseline.items()},
-        "post_tent": {k: dict(v) for k, v in post_tent.items()},
+        "post_tta": {k: dict(v) for k, v in post_tta.items()},
         "n_train_ids": n_train_cls, "n_test_ids": n_test_cls,
         "train_spectrums": cfg.train_spectrums,
         "test_id_ratio": cfg.test_id_ratio,

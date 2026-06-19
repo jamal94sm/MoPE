@@ -63,9 +63,10 @@ def eval_test_spectrums(model, test_loaders, cfg, tag=""):
 
 
 def train_arcface(model, train_loader, train_params, cfg, epochs, tag,
-                  test_loaders=None, ckpt_path=None):
+                  test_loaders=None, ckpt_path=None, lr=None):
     """Generic ArcFace training loop. Returns best checkpoint path."""
-    optimizer = torch.optim.AdamW(train_params, lr=cfg.arcface_lr,
+    lr = lr or cfg.arcface_lr
+    optimizer = torch.optim.AdamW(train_params, lr=lr,
                                    weight_decay=cfg.arcface_wd)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=epochs, eta_min=1e-6)
@@ -308,7 +309,8 @@ def adapt_casia_ms(cfg):
     ckpt2 = os.path.join(cfg.output_dir, "phase2_best.pth")
     train_arcface(model, test_head_train_loader, head_params, cfg,
                   cfg.arcface_head_epochs, "P2",
-                  test_loaders=test_loaders, ckpt_path=ckpt2)
+                  test_loaders=test_loaders, ckpt_path=ckpt2,
+                  lr=cfg.arcface_lr_phase2)
 
     # Load best head_B
     if os.path.exists(ckpt2):

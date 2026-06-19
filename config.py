@@ -45,10 +45,10 @@ def get_cfg(args=None):
     p.add_argument("--num_workers", type=int, default=4)
 
     # ─── CASIA-MS specific ────────────────────────────────────
-    p.add_argument("--train_spectrums", nargs="*", default=["WHT", "940"],
+    p.add_argument("--train_spectrums", nargs="*", default=["WHT"],
                    help="Spectrums for training (source domain). "
                         "Test spectrums = all remaining (target domain).")
-    p.add_argument("--test_id_ratio", type=float, default=0.2,
+    p.add_argument("--test_id_ratio", type=float, default=0.5,
                    help="Fraction of identities held out for testing. "
                         "0.2 = 20%% test IDs, 80%% train IDs.")
     p.add_argument("--gallery_ratio", type=float, default=0.1,
@@ -57,9 +57,9 @@ def get_cfg(args=None):
                    help="Use oracle 3-group spectrum assignment for TENT")
 
     # ─── ArcFace training ─────────────────────────────────────
-    p.add_argument("--arcface_epochs", type=int, default=50,
+    p.add_argument("--arcface_epochs", type=int, default=20,
                    help="Epochs to train backbone + train-ID head")
-    p.add_argument("--arcface_head_epochs", type=int, default=30,
+    p.add_argument("--arcface_head_epochs", type=int, default=10,
                    help="Epochs to train test-ID head (backbone frozen)")
     p.add_argument("--arcface_lr", type=float, default=1e-4,
                    help="Learning rate for Phase 1 (backbone + head_A)")
@@ -69,7 +69,7 @@ def get_cfg(args=None):
                    help="Weight decay for ArcFace training")
     p.add_argument("--arcface_eval_every", type=int, default=5,
                    help="Evaluate on test set every N epochs")
-    p.add_argument("--arcface_freeze_ratio", type=float, default=0.75,
+    p.add_argument("--arcface_freeze_ratio", type=float, default=0.9,
                    help="Fraction of backbone params to freeze during "
                         "Phase 1 training. 0.75 = finetune last 25%%.")
 

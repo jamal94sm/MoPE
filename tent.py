@@ -213,29 +213,81 @@ def get_tta_augmentation(img_size=112):
     ])
 
 
-def augment_batch(x, aug_transform, mean=0.5, std=0.5):
+def fft_amplitude_swap(x, beta=0.5):
+    """
+    FFT-based augmentation: swap low-frequency amplitude of each sample
+    with a random other sample in the batch.
+
+    Keeps phase (structure/identity) intact, changes amplitude
+    (style/appearance). Since all samples are from the same domain,
+    this creates valid within-domain variations.
+
+    x: (B, C, H, W) tensor in normalized space
+    beta: fraction of low-frequency band to swap (0=none, 1=all)
+    Returns: augmented tensor, same shape
+    """
+    B, C, H, W = x.shape
+    # Random permutation for pairing
+    perm = torch.randperm(B, device=x.device)
+    x_partner = x[perm]
+
+    # FFT
+    fft_x = torch.fft.fft2(x, dim=(-2, -1))
+    fft_p = torch.fft.fft2(x_partner, dim=(-2, -1))
+
+    amp_x = torch.abs(fft_x)
+    phase_x = torch.angle(fft_x)
+    amp_p = torch.abs(fft_p)
+
+    # Low-frequency mask (center of spectrum)
+    cy, cx = H // 2, W // 2
+    rh = int(H * beta * 0.5)
+    rw = int(W * beta * 0.5)
+
+    # Shift so DC is at center
+    amp_x_shifted = torch.fft.fftshift(amp_x, dim=(-2, -1))
+    amp_p_shifted = torch.fft.fftshift(amp_p, dim=(-2, -1))
+
+    # Swap low-frequency amplitudes
+    amp_mixed = amp_x_shifted.clone()
+    y1, y2 = max(0, cy - rh), min(H, cy + rh)
+    x1, x2 = max(0, cx - rw), min(W, cx + rw)
+    amp_mixed[:, :, y1:y2, x1:x2] = amp_p_shifted[:, :, y1:y2, x1:x2]
+
+    # Unshift
+    amp_mixed = torch.fft.ifftshift(amp_mixed, dim=(-2, -1))
+
+    # Reconstruct: mixed amplitude + original phase
+    fft_mixed = amp_mixed * torch.exp(1j * phase_x)
+    x_aug = torch.fft.ifft2(fft_mixed, dim=(-2, -1)).real
+
+    return x_aug
+
+
+def augment_batch(x, aug_transform, mean=0.5, std=0.5, use_fft=False,
+                  fft_beta=0.5):
     """
     Apply augmentation to a normalized batch.
-    Denormalize → augment (PIL-like ops on tensors) → renormalize.
-
-    x: (B, C, H, W) normalized tensor
-    Returns: augmented tensor, same shape
+    Combines spatial augmentation + optional FFT amplitude swap.
     """
     # Denormalize to [0, 1]
     x_denorm = x * std + mean
     x_denorm = x_denorm.clamp(0, 1)
 
-    # Augment each image
+    # Spatial augmentation per image
     augmented = []
     for i in range(x_denorm.shape[0]):
-        img = x_denorm[i]  # (C, H, W) tensor in [0, 1]
-        img_aug = aug_transform(img)  # torchvision transforms work on tensors
+        img_aug = aug_transform(x_denorm[i])
         augmented.append(img_aug)
-
     x_aug = torch.stack(augmented).to(x.device)
 
     # Renormalize
     x_aug = (x_aug - mean) / std
+
+    # FFT amplitude swap (operates on normalized images)
+    if use_fft:
+        x_aug = fft_amplitude_swap(x_aug, beta=fft_beta)
+
     return x_aug
 
 
@@ -281,7 +333,8 @@ class ContrastiveTent(nn.Module):
     """
     def __init__(self, model, optimizer, aug_transform,
                  contrastive_lambda=1.0, contrastive_temp=0.5,
-                 steps=1, episodic=False, use_entropy=True):
+                 steps=1, episodic=False, use_entropy=True,
+                 use_fft=True, fft_beta=0.5):
         super().__init__()
         self.model = model
         self.optimizer = optimizer
@@ -291,6 +344,8 @@ class ContrastiveTent(nn.Module):
         self.steps = steps
         self.episodic = episodic
         self.use_entropy = use_entropy
+        self.use_fft = use_fft
+        self.fft_beta = fft_beta
         assert steps > 0
 
         self.model_state, self.optimizer_state = \
@@ -317,7 +372,8 @@ class ContrastiveTent(nn.Module):
             z_orig = self.model(x)
 
         # Augmented forward
-        x_aug = augment_batch(x, self.aug_transform)
+        x_aug = augment_batch(x, self.aug_transform,
+                              use_fft=self.use_fft, fft_beta=self.fft_beta)
         if hasattr(self.model, 'get_embeddings'):
             z_aug = self.model.get_embeddings(x_aug)
         elif hasattr(self.model, 'backbone'):
@@ -345,6 +401,128 @@ class ContrastiveTent(nn.Module):
         self.optimizer.zero_grad()
 
         return logits.detach(), info
+
+    def reset(self):
+        if self.model_state is None or self.optimizer_state is None:
+            raise Exception("cannot reset without saved state")
+        load_model_and_optimizer(self.model, self.optimizer,
+                                self.model_state, self.optimizer_state)
+
+
+# ══════════════════════════════════════════════════════════════
+#  Feature-level Information Maximization
+# ══════════════════════════════════════════════════════════════
+
+def feature_im_loss(z, temperature=0.1):
+    """
+    Information Maximization at feature level (no head needed).
+
+    Conditional entropy: each sample should have clear neighbors
+      → sharpen the neighborhood distribution
+    Marginal entropy: overall distribution should be uniform
+      → prevent collapse to a single cluster
+
+    z: (B, D) embeddings
+    Returns: scalar loss = H_conditional - H_marginal
+    """
+    z = F.normalize(z, dim=-1)
+    sim = (z @ z.T) / temperature  # (B, B)
+
+    # Mask self-similarity
+    mask = torch.eye(z.shape[0], device=z.device).bool()
+    sim.masked_fill_(mask, -1e9)
+
+    p = F.softmax(sim, dim=-1)  # (B, B) neighborhood distribution
+
+    # Conditional entropy: should be low (sharp neighborhoods)
+    H_cond = -(p * (p + 1e-8).log()).sum(-1).mean()
+
+    # Marginal entropy: should be high (uniform spread)
+    p_marginal = p.mean(dim=0)
+    H_marg = -(p_marginal * (p_marginal + 1e-8).log()).sum()
+
+    return H_cond - H_marg
+
+
+class ContrastiveFIM(nn.Module):
+    """
+    Contrastive + Feature Information Maximization.
+
+    Loss = λ_con * NT-Xent(z, z_aug) + λ_fim * FeatureIM(z)
+
+    NT-Xent: augmentation invariance (pull views together)
+    Feature IM: sharp clusters + uniform spread (no head needed)
+    FFT amplitude swap: within-domain style augmentation
+
+    No classification head required.
+    """
+    def __init__(self, model, optimizer, aug_transform,
+                 contrastive_lambda=1.0, contrastive_temp=0.5,
+                 fim_lambda=1.0, fim_temp=0.1,
+                 use_fft=True, fft_beta=0.5,
+                 steps=1, episodic=False):
+        super().__init__()
+        self.model = model
+        self.optimizer = optimizer
+        self.aug_transform = aug_transform
+        self.contrastive_lambda = contrastive_lambda
+        self.contrastive_temp = contrastive_temp
+        self.fim_lambda = fim_lambda
+        self.fim_temp = fim_temp
+        self.use_fft = use_fft
+        self.fft_beta = fft_beta
+        self.steps = steps
+        self.episodic = episodic
+        assert steps > 0
+
+        self.model_state, self.optimizer_state = \
+            copy_model_and_optimizer(self.model, self.optimizer)
+
+    def _get_embeddings(self, x):
+        if hasattr(self.model, 'get_embeddings'):
+            return self.model.get_embeddings(x)
+        elif hasattr(self.model, 'backbone'):
+            return self.model.backbone(x)
+        else:
+            return self.model(x)
+
+    def forward(self, x):
+        if self.episodic:
+            self.reset()
+        for _ in range(self.steps):
+            outputs, info = self._adapt(x)
+        return outputs, info
+
+    @torch.enable_grad()
+    def _adapt(self, x):
+        # Original embeddings
+        z_orig = self._get_embeddings(x)
+
+        # Augmented embeddings (spatial + optional FFT)
+        x_aug = augment_batch(x, self.aug_transform,
+                              use_fft=self.use_fft, fft_beta=self.fft_beta)
+        z_aug = self._get_embeddings(x_aug)
+
+        info = {}
+        total_loss = torch.tensor(0.0, device=x.device)
+
+        # Contrastive: pull (z_orig, z_aug) pairs together
+        con_loss = nt_xent_loss(z_orig, z_aug, self.contrastive_temp)
+        total_loss = total_loss + self.contrastive_lambda * con_loss
+        info["contrastive"] = con_loss.item()
+
+        # Feature IM: sharpen clusters + prevent collapse
+        fim_loss = feature_im_loss(z_orig, self.fim_temp)
+        total_loss = total_loss + self.fim_lambda * fim_loss
+        info["fim"] = fim_loss.item()
+
+        info["total"] = total_loss.item()
+
+        total_loss.backward()
+        self.optimizer.step()
+        self.optimizer.zero_grad()
+
+        return z_orig.detach(), info
 
     def reset(self):
         if self.model_state is None or self.optimizer_state is None:

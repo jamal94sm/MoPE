@@ -184,3 +184,170 @@ def configure_model_bna(model):
 def forward_bna(x, model):
     """Forward pass for BNA. No gradients, just updates BN running stats."""
     return model(x)
+
+
+# ══════════════════════════════════════════════════════════════
+#  Contrastive TENT: Entropy + Contrastive on augmented pairs
+# ══════════════════════════════════════════════════════════════
+
+import torch.nn.functional as F
+from torchvision import transforms
+
+
+def get_tta_augmentation(img_size=112):
+    """
+    Mild augmentation for contrastive TTA.
+    Enough to create a different view, not so much it destroys identity.
+    """
+    return transforms.Compose([
+        transforms.RandomResizedCrop(img_size, scale=(0.85, 1.0),
+                                      ratio=(0.95, 1.05)),
+        transforms.RandomApply([
+            transforms.ColorJitter(brightness=0.15, contrast=0.15,
+                                    saturation=0.05, hue=0.02),
+        ], p=0.5),
+        transforms.RandomApply([
+            transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 0.5)),
+        ], p=0.3),
+        transforms.RandomHorizontalFlip(p=0.5),
+    ])
+
+
+def augment_batch(x, aug_transform, mean=0.5, std=0.5):
+    """
+    Apply augmentation to a normalized batch.
+    Denormalize → augment (PIL-like ops on tensors) → renormalize.
+
+    x: (B, C, H, W) normalized tensor
+    Returns: augmented tensor, same shape
+    """
+    # Denormalize to [0, 1]
+    x_denorm = x * std + mean
+    x_denorm = x_denorm.clamp(0, 1)
+
+    # Augment each image
+    augmented = []
+    for i in range(x_denorm.shape[0]):
+        img = x_denorm[i]  # (C, H, W) tensor in [0, 1]
+        img_aug = aug_transform(img)  # torchvision transforms work on tensors
+        augmented.append(img_aug)
+
+    x_aug = torch.stack(augmented).to(x.device)
+
+    # Renormalize
+    x_aug = (x_aug - mean) / std
+    return x_aug
+
+
+def nt_xent_loss(z1, z2, temperature=0.5):
+    """
+    NT-Xent (Normalized Temperature-scaled Cross Entropy) contrastive loss.
+
+    z1, z2: (B, D) L2-normalized embeddings (anchor, positive)
+    Each z1[i] is positive with z2[i], negative with all others.
+
+    Returns: scalar loss
+    """
+    B = z1.shape[0]
+    z1 = F.normalize(z1, dim=-1)
+    z2 = F.normalize(z2, dim=-1)
+
+    # Similarity matrix: (2B, 2B)
+    z = torch.cat([z1, z2], dim=0)  # (2B, D)
+    sim = (z @ z.T) / temperature   # (2B, 2B)
+
+    # Mask out self-similarity (diagonal)
+    mask = torch.eye(2 * B, device=z.device).bool()
+    sim.masked_fill_(mask, -1e9)
+
+    # Positive pairs: (i, i+B) and (i+B, i)
+    labels = torch.cat([
+        torch.arange(B, 2 * B, device=z.device),  # z1[i] → z2[i]
+        torch.arange(0, B, device=z.device),        # z2[i] → z1[i]
+    ])
+
+    return F.cross_entropy(sim, labels)
+
+
+class ContrastiveTent(nn.Module):
+    """
+    TENT + Contrastive loss on augmented views.
+
+    Loss = entropy(logits) + λ * NT-Xent(z_orig, z_aug)
+
+    Entropy pushes BN toward confident predictions.
+    Contrastive pulls embeddings of augmented views together,
+    improving feature consistency across domain variations.
+    """
+    def __init__(self, model, optimizer, aug_transform,
+                 contrastive_lambda=1.0, contrastive_temp=0.5,
+                 steps=1, episodic=False, use_entropy=True):
+        super().__init__()
+        self.model = model
+        self.optimizer = optimizer
+        self.aug_transform = aug_transform
+        self.contrastive_lambda = contrastive_lambda
+        self.contrastive_temp = contrastive_temp
+        self.steps = steps
+        self.episodic = episodic
+        self.use_entropy = use_entropy
+        assert steps > 0
+
+        self.model_state, self.optimizer_state = \
+            copy_model_and_optimizer(self.model, self.optimizer)
+
+    def forward(self, x):
+        if self.episodic:
+            self.reset()
+        for _ in range(self.steps):
+            outputs, info = self._adapt(x)
+        return outputs, info
+
+    @torch.enable_grad()
+    def _adapt(self, x):
+        # Original forward
+        logits = self.model(x)
+
+        # Get embeddings for contrastive
+        if hasattr(self.model, 'get_embeddings'):
+            z_orig = self.model.get_embeddings(x)
+        elif hasattr(self.model, 'backbone'):
+            z_orig = self.model.backbone(x)
+        else:
+            z_orig = self.model(x)
+
+        # Augmented forward
+        x_aug = augment_batch(x, self.aug_transform)
+        if hasattr(self.model, 'get_embeddings'):
+            z_aug = self.model.get_embeddings(x_aug)
+        elif hasattr(self.model, 'backbone'):
+            z_aug = self.model.backbone(x_aug)
+        else:
+            z_aug = self.model(x_aug)
+
+        # Losses
+        info = {}
+
+        total_loss = torch.tensor(0.0, device=x.device)
+
+        if self.use_entropy:
+            ent_loss = softmax_entropy(logits).mean(0)
+            total_loss = total_loss + ent_loss
+            info["entropy"] = ent_loss.item()
+
+        con_loss = nt_xent_loss(z_orig, z_aug, self.contrastive_temp)
+        total_loss = total_loss + self.contrastive_lambda * con_loss
+        info["contrastive"] = con_loss.item()
+        info["total"] = total_loss.item()
+
+        total_loss.backward()
+        self.optimizer.step()
+        self.optimizer.zero_grad()
+
+        return logits.detach(), info
+
+    def reset(self):
+        if self.model_state is None or self.optimizer_state is None:
+            raise Exception("cannot reset without saved state")
+        load_model_and_optimizer(self.model, self.optimizer,
+                                self.model_state, self.optimizer_state)

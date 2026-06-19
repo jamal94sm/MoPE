@@ -99,7 +99,14 @@ def get_cfg(args=None):
                    help="Number of classes (ImageNet-C)")
     p.add_argument("--img_size", type=int, default=224)
 
-    # ─── TENT parameters ──────────────────────────────────────
+    # ─── TTA method & parameters ─────────────────────────────
+    p.add_argument("--tta_method", default="tent",
+                   choices=["tent", "bna", "tent_headA"],
+                   help="TTA method: "
+                        "'tent' = entropy min on head_B (test-ID head), "
+                        "'bna' = batch norm adaptation (no head needed), "
+                        "'tent_headA' = entropy min using frozen head_A "
+                        "(train-ID head, test IDs not in it)")
     p.add_argument("--tent_lr", type=float, default=1e-3,
                    help="TENT learning rate for BN affine params")
     p.add_argument("--tent_steps", type=int, default=1,

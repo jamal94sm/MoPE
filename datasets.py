@@ -155,11 +155,14 @@ class CASIAMSDataset(Dataset):
 class CASIAMSTrainDataset(Dataset):
     """
     Combined multi-spectrum dataset for ArcFace training.
-    Includes augmentation.
+    Includes augmentation. Use heavy_aug=True for small datasets.
     """
-    def __init__(self, file_lists, identity_to_idx, img_size=112):
+    def __init__(self, file_lists, identity_to_idx, img_size=112,
+                 heavy_aug=False, repeat=1):
         """
         file_lists: dict {spectrum: [(path, identity_str), ...]}
+        heavy_aug: stronger augmentation for small datasets
+        repeat: duplicate samples N times (with different augmentation each)
         """
         self.identity_to_idx = identity_to_idx
         self.samples = []
@@ -168,18 +171,48 @@ class CASIAMSTrainDataset(Dataset):
                 if ident in identity_to_idx:
                     self.samples.append((path, identity_to_idx[ident]))
 
-        self.transform = transforms.Compose([
-            transforms.Resize((img_size, img_size)),
-            transforms.RandomChoice([
-                transforms.ColorJitter(brightness=0, contrast=0.05),
-                transforms.RandomResizedCrop(img_size, scale=(0.85, 1.0),
-                                             ratio=(1.0, 1.0)),
-                transforms.RandomPerspective(distortion_scale=0.1, p=1),
-                transforms.RandomRotation(8),
-            ]),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-        ])
+        # Repeat samples for small datasets
+        if repeat > 1:
+            self.samples = self.samples * repeat
+
+        if heavy_aug:
+            self.transform = transforms.Compose([
+                transforms.Resize((img_size, img_size)),
+                transforms.RandomApply([
+                    transforms.ColorJitter(brightness=0.2, contrast=0.2,
+                                           saturation=0.1, hue=0.05),
+                ], p=0.5),
+                transforms.RandomApply([
+                    transforms.RandomResizedCrop(img_size, scale=(0.75, 1.0),
+                                                  ratio=(0.9, 1.1)),
+                ], p=0.5),
+                transforms.RandomApply([
+                    transforms.RandomPerspective(distortion_scale=0.15, p=1),
+                ], p=0.3),
+                transforms.RandomApply([
+                    transforms.RandomRotation(12),
+                ], p=0.3),
+                transforms.RandomHorizontalFlip(p=0.5),
+                transforms.RandomApply([
+                    transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 1.0)),
+                ], p=0.2),
+                transforms.ToTensor(),
+                transforms.RandomErasing(p=0.1, scale=(0.02, 0.1)),
+                transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+            ])
+        else:
+            self.transform = transforms.Compose([
+                transforms.Resize((img_size, img_size)),
+                transforms.RandomChoice([
+                    transforms.ColorJitter(brightness=0, contrast=0.05),
+                    transforms.RandomResizedCrop(img_size, scale=(0.85, 1.0),
+                                                  ratio=(1.0, 1.0)),
+                    transforms.RandomPerspective(distortion_scale=0.1, p=1),
+                    transforms.RandomRotation(8),
+                ]),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+            ])
 
     def __len__(self):
         return len(self.samples)
@@ -286,13 +319,16 @@ def get_casia_ms_train_test(data_dir, train_spectrums, batch_size=64,
           f"({n_train} IDs × {len(train_spectrums)} spectrums)")
 
     # ── Test head training: train_spectrums × test_ids ──
-    th_train_ds = CASIAMSTrainDataset(test_head_files, test_id_map, img_size)
+    # Small dataset → heavy augmentation + 4× repeat
+    th_train_ds = CASIAMSTrainDataset(test_head_files, test_id_map, img_size,
+                                       heavy_aug=True, repeat=4)
     test_head_train_loader = DataLoader(
         th_train_ds, batch_size=batch_size, shuffle=True,
         num_workers=num_workers, pin_memory=True, drop_last=True)
 
-    th_count = len(th_train_ds)
-    print(f"  Test head training: {th_count} samples "
+    th_original = sum(len(v) for v in test_head_files.values())
+    print(f"  Test head training: {th_original} original samples "
+          f"× 4 repeat = {len(th_train_ds)} (heavy aug) "
           f"({n_test} IDs × {len(train_spectrums)} spectrums)")
 
     # ── Test evaluation: test_spectrums × test_ids ──

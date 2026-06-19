@@ -297,12 +297,13 @@ def adapt_casia_ms(cfg):
 
     # Replace head
     head_B = ArcFaceHead(n_test_cls, embedding_size=512,
-                          s=cfg.arcface_s, m=cfg.arcface_m).to(cfg.device)
+                          s=cfg.arcface_s, m=cfg.arcface_m_phase2).to(cfg.device)
     model.head = head_B
 
     head_params = list(model.head.parameters())
     print(f"[Phase 2] Head_B: {n_test_cls} classes, "
-          f"{sum(p.numel() for p in head_params)} params")
+          f"{sum(p.numel() for p in head_params)} params, "
+          f"margin={cfg.arcface_m_phase2}")
 
     ckpt2 = os.path.join(cfg.output_dir, "phase2_best.pth")
     train_arcface(model, test_head_train_loader, head_params, cfg,

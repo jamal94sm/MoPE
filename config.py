@@ -101,12 +101,13 @@ def get_cfg(args=None):
 
     # ─── TTA method & parameters ─────────────────────────────
     p.add_argument("--tta_method", default="tent",
-                   choices=["tent", "bna", "contrastive"],
+                   choices=["tent", "bna", "contrastive", "contrastive_fim"],
                    help="TTA method: "
                         "'tent' = entropy min on head_B, "
                         "'bna' = batch norm adaptation (no head), "
-                        "'contrastive' = entropy(head_B) + NT-Xent "
-                        "on augmented embedding pairs")
+                        "'contrastive' = entropy(head_B) + NT-Xent, "
+                        "'contrastive_fim' = NT-Xent + feature IM "
+                        "(no head needed)")
     p.add_argument("--tent_lr", type=float, default=1e-3,
                    help="TENT learning rate for BN affine params")
     p.add_argument("--tent_steps", type=int, default=1,
@@ -114,9 +115,18 @@ def get_cfg(args=None):
     p.add_argument("--tent_episodic", action="store_true", default=False,
                    help="Reset BN params after each domain/spectrum")
     p.add_argument("--contrastive_lambda", type=float, default=1.0,
-                   help="Weight of contrastive loss vs entropy loss")
+                   help="Weight of contrastive (NT-Xent) loss")
     p.add_argument("--contrastive_temp", type=float, default=0.5,
                    help="Temperature for NT-Xent contrastive loss")
+    p.add_argument("--fim_lambda", type=float, default=1.0,
+                   help="Weight of feature IM loss (contrastive_fim mode)")
+    p.add_argument("--fim_temp", type=float, default=0.1,
+                   help="Temperature for feature IM neighborhood softmax")
+    p.add_argument("--use_fft_aug", action="store_true", default=True,
+                   help="Use FFT amplitude swap augmentation")
+    p.add_argument("--no_fft_aug", dest="use_fft_aug", action="store_false")
+    p.add_argument("--fft_beta", type=float, default=0.2,
+                   help="Fraction of low-frequency band to swap in FFT aug")
 
     # ─── Evaluation ───────────────────────────────────────────
     p.add_argument("--eval_backbone", action="store_true", default=False,

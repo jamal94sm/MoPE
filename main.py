@@ -284,7 +284,7 @@ def adapt_casia_ms(cfg):
     # ══════════════════════════════════════════════════════════
     model.backbone.requires_grad_(False)
 
-    if cfg.tta_method in ("tent", "contrastive_em"):
+    if cfg.tta_method in ("tent", "contrastive_em", "contrastive_fim"):
         print(f"\n{'─'*70}")
         print(f"  PHASE 2: Train test-ID head ({n_test_cls} classes)")
         print(f"  Source domain: {cfg.train_spectrums}")
@@ -332,8 +332,10 @@ def adapt_casia_ms(cfg):
     #  PHASE 4+5: Episodic TTA — adapt → evaluate → reset
     # ══════════════════════════════════════════════════════════
     print(f"\n{'─'*70}")
-    print(f"  PHASE 4+5: Episodic {method_label}")
-    print(f"  Each domain: adapt → evaluate → reset to pre-adapt state")
+    print(f"  PHASE 4+5: {method_label} "
+          f"({'episodic — reset each domain' if cfg.reset_tta else 'continual — no reset'})")
+    print(f"  Each domain: adapt → evaluate"
+          f"{' → reset' if cfg.reset_tta else ''}")
     print(f"{'─'*70}")
 
     # Build domain sequence
@@ -351,15 +353,23 @@ def adapt_casia_ms(cfg):
         dom_seq = [(s, i, [(s, ld, ds)])
                    for i, (s, ld, ds) in enumerate(test_loaders)]
 
-    # Save pre-adaptation state
+    # Save pre-adaptation state (for reset mode)
     from copy import deepcopy
     pre_adapt_state = deepcopy(model.state_dict())
+
+    # For continual mode: configure model once before the loop
+    if not cfg.reset_tta and cfg.tta_method != "bna":
+        model = (tent.configure_model_safe(model) if cfg.safe_bn
+                 else tent.configure_model(model))
+        params, _ = tent.collect_params(model)
+        opt = torch.optim.Adam(params, lr=cfg.tent_lr)
 
     post_tta = {}
 
     for di, (dn, _, slist) in enumerate(dom_seq):
-        # ── Reset to pre-adapt state ──
-        model.load_state_dict(deepcopy(pre_adapt_state))
+        # ── Reset to pre-adapt state (episodic only) ──
+        if cfg.reset_tta:
+            model.load_state_dict(deepcopy(pre_adapt_state))
 
         print(f"\n  ┌── [{di+1}/{len(dom_seq)}] {dn} "
               f"({[s for s,_,_ in slist]})")
@@ -369,7 +379,10 @@ def adapt_casia_ms(cfg):
 
         # ── Configure + Adapt ──
         if cfg.tta_method == "bna":
-            model = tent.configure_model_bna(model)
+            if cfg.reset_tta:
+                model = tent.configure_model_bna(model)
+            elif di == 0:
+                model = tent.configure_model_bna(model)
             gb = 0
             for sn, ld, _ in slist:
                 for imgs, _ in ld:
@@ -378,10 +391,12 @@ def adapt_casia_ms(cfg):
             print(f"  │ {gb} batches (forward only)")
 
         else:
-            model = (tent.configure_model_safe(model) if cfg.safe_bn
-                     else tent.configure_model(model))
-            params, _ = tent.collect_params(model)
-            opt = torch.optim.Adam(params, lr=cfg.tent_lr)
+            # For episodic: reconfigure each domain
+            if cfg.reset_tta:
+                model = (tent.configure_model_safe(model) if cfg.safe_bn
+                         else tent.configure_model(model))
+                params, _ = tent.collect_params(model)
+                opt = torch.optim.Adam(params, lr=cfg.tent_lr)
 
             if cfg.tta_method == "tent":
                 tta_obj = tent.Tent(model, opt, steps=cfg.tent_steps)
@@ -471,11 +486,15 @@ def adapt_casia_ms(cfg):
                   f"R1 {b.get('rank1',-1):.2f}→{ver['rank1']:.2f}% "
                   f"({'↑' if dr > 0 else '↓'}{abs(dr):.2f})")
 
-        print(f"  └── Reset for next domain")
+        if cfg.reset_tta:
+            print(f"  └── Reset for next domain")
+        else:
+            print(f"  └── Continuing to next domain (no reset)")
 
     # ── Final comparison ──
+    mode_str = "episodic" if cfg.reset_tta else "continual"
     print(f"\n{'='*80}")
-    print(f"  FINAL COMPARISON ({method_label}, episodic)")
+    print(f"  FINAL COMPARISON ({method_label}, {mode_str})")
     print(f"  Train IDs: {n_train_cls} | Test IDs: {n_test_cls}")
     print(f"  Source: {cfg.train_spectrums} | Target: "
           f"{[s for s,_,_ in test_loaders]}")
@@ -505,7 +524,7 @@ def adapt_casia_ms(cfg):
           f"{'↑' if dr > 0 else '↓'}{abs(dr):>6.2f}%")
 
     save_data = {
-        "tta_method": cfg.tta_method, "episodic": True,
+        "tta_method": cfg.tta_method, "episodic": cfg.reset_tta,
         "baseline": {k: dict(v) for k, v in baseline.items()},
         "post_tta": {k: dict(v) for k, v in post_tta.items()},
         "n_train_ids": n_train_cls, "n_test_ids": n_test_cls,

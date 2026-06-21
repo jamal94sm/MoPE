@@ -284,7 +284,7 @@ def adapt_casia_ms(cfg):
     # ══════════════════════════════════════════════════════════
     model.backbone.requires_grad_(False)
 
-    if cfg.tta_method in ("tent", "contrastive"):
+    if cfg.tta_method in ("tent", "contrastive_em"):
         print(f"\n{'─'*70}")
         print(f"  PHASE 2: Train test-ID head ({n_test_cls} classes)")
         print(f"  Source domain: {cfg.train_spectrums}")
@@ -315,7 +315,7 @@ def adapt_casia_ms(cfg):
             print(f"\n  Loaded best Phase 2 head (epoch {ckpt['epoch']}, "
                   f"Rank-1={ckpt['rank1']:.2f}%)")
     else:
-        # bna, contrastive_fim, fim need no head
+        # bna, contrastive, contrastive_fim, fim need no head
         print(f"\n{'─'*70}")
         print(f"  PHASE 2: SKIPPED ({method_label} needs no classification head)")
         print(f"{'─'*70}")
@@ -352,7 +352,7 @@ def adapt_casia_ms(cfg):
 
     # ── TENT ──
     if cfg.tta_method == "tent":
-        model = tent.configure_model(model)
+        model = (tent.configure_model_safe(model) if cfg.safe_bn else tent.configure_model(model))
         tent.check_model(model)
         params, _ = tent.collect_params(model)
         opt = torch.optim.Adam(params, lr=cfg.tent_lr)
@@ -381,7 +381,7 @@ def adapt_casia_ms(cfg):
 
     # ── CONTRASTIVE: entropy(head_B) + NT-Xent ──
     elif cfg.tta_method == "contrastive":
-        model = tent.configure_model(model)
+        model = (tent.configure_model_safe(model) if cfg.safe_bn else tent.configure_model(model))
         tent.check_model(model)
         params, _ = tent.collect_params(model)
         opt = torch.optim.Adam(params, lr=cfg.tent_lr)
@@ -421,7 +421,7 @@ def adapt_casia_ms(cfg):
 
     # ── FIM only (no head, no augmentation) ──
     elif cfg.tta_method == "fim":
-        model = tent.configure_model(model)
+        model = (tent.configure_model_safe(model) if cfg.safe_bn else tent.configure_model(model))
         tent.check_model(model)
         params, _ = tent.collect_params(model)
         opt = torch.optim.Adam(params, lr=cfg.tent_lr)
@@ -469,7 +469,7 @@ def adapt_casia_ms(cfg):
 
     # ── CONTRASTIVE + Feature IM (no head) ──
     elif cfg.tta_method == "contrastive_fim":
-        model = tent.configure_model(model)
+        model = (tent.configure_model_safe(model) if cfg.safe_bn else tent.configure_model(model))
         tent.check_model(model)
         params, _ = tent.collect_params(model)
         opt = torch.optim.Adam(params, lr=cfg.tent_lr)

@@ -329,10 +329,11 @@ def adapt_casia_ms(cfg):
     baseline = eval_test_spectrums(model, test_loaders, cfg, tag="[pre-TTA] ")
 
     # ══════════════════════════════════════════════════════════
-    #  PHASE 4: TTA adaptation
+    #  PHASE 4+5: Episodic TTA — adapt → evaluate → reset
     # ══════════════════════════════════════════════════════════
     print(f"\n{'─'*70}")
-    print(f"  PHASE 4: {method_label} on Target Domains")
+    print(f"  PHASE 4+5: Episodic {method_label}")
+    print(f"  Each domain: adapt → evaluate → reset to pre-adapt state")
     print(f"{'─'*70}")
 
     # Build domain sequence
@@ -350,180 +351,131 @@ def adapt_casia_ms(cfg):
         dom_seq = [(s, i, [(s, ld, ds)])
                    for i, (s, ld, ds) in enumerate(test_loaders)]
 
-    # ── TENT ──
-    if cfg.tta_method == "tent":
-        model = (tent.configure_model_safe(model) if cfg.safe_bn else tent.configure_model(model))
-        tent.check_model(model)
-        params, _ = tent.collect_params(model)
-        opt = torch.optim.Adam(params, lr=cfg.tent_lr)
-        tented = tent.Tent(model, opt, steps=cfg.tent_steps,
-                           episodic=cfg.tent_episodic)
-        print(f"[TENT] {len(params)} BN params "
-              f"({sum(p.numel() for p in params)} values)")
-        print(f"[TENT] Entropy from: head_B ({n_test_cls} classes)")
+    # Save pre-adaptation state
+    from copy import deepcopy
+    pre_adapt_state = deepcopy(model.state_dict())
 
-        for di, (dn, _, slist) in enumerate(dom_seq):
-            if cfg.tent_episodic: tented.reset()
-            tb = sum(len(l) for _, l, _ in slist)
-            t0 = time.time()
-            print(f"\n  [{di+1}/{len(dom_seq)}] {dn} "
-                  f"({[s for s,_,_ in slist]})")
-            print(f"  {'bat':>5} │{'spec':>6} │{'H':>6}")
-            gb = 0
-            for sn, ld, _ in slist:
-                for imgs, _ in ld:
-                    logits = tented(imgs.to(cfg.device))
-                    if gb < 5 or gb % 50 == 0 or gb == tb - 1:
-                        H = tent.softmax_entropy(logits).mean().item()
-                        print(f"  {gb:5d} │{sn:>6s} │{H:6.3f}")
-                    gb += 1
-            print(f"  Time: {time.time()-t0:.1f}s")
+    post_tta = {}
 
-    # ── CONTRASTIVE: entropy(head_B) + NT-Xent ──
-    elif cfg.tta_method == "contrastive":
-        model = (tent.configure_model_safe(model) if cfg.safe_bn else tent.configure_model(model))
-        tent.check_model(model)
-        params, _ = tent.collect_params(model)
-        opt = torch.optim.Adam(params, lr=cfg.tent_lr)
-        aug_tf = tent.get_tta_augmentation(cfg.img_size)
-        con = tent.ContrastiveTent(
-            model, opt, aug_tf,
-            contrastive_lambda=cfg.contrastive_lambda,
-            contrastive_temp=cfg.contrastive_temp,
-            steps=cfg.tent_steps, episodic=cfg.tent_episodic,
-            use_entropy=True,
-            use_fft=cfg.use_fft_aug, fft_beta=cfg.fft_beta)
-        print(f"[CONTRASTIVE] {len(params)} BN params "
-              f"({sum(p.numel() for p in params)} values)")
-        print(f"[CONTRASTIVE] Entropy from: head_B ({n_test_cls} classes)")
-        print(f"[CONTRASTIVE] λ={cfg.contrastive_lambda}, "
-              f"τ={cfg.contrastive_temp}")
+    for di, (dn, _, slist) in enumerate(dom_seq):
+        # ── Reset to pre-adapt state ──
+        model.load_state_dict(deepcopy(pre_adapt_state))
 
-        for di, (dn, _, slist) in enumerate(dom_seq):
-            if cfg.tent_episodic: con.reset()
-            tb = sum(len(l) for _, l, _ in slist)
-            t0 = time.time()
-            print(f"\n  [{di+1}/{len(dom_seq)}] {dn} "
-                  f"({[s for s,_,_ in slist]})")
-            print(f"  {'bat':>5} │{'spec':>6} │{'H':>6} │"
-                  f"{'con':>6} │{'total':>6}")
-            gb = 0
-            for sn, ld, _ in slist:
-                for imgs, _ in ld:
-                    logits, info = con(imgs.to(cfg.device))
-                    if gb < 5 or gb % 50 == 0 or gb == tb - 1:
-                        print(f"  {gb:5d} │{sn:>6s} │"
-                              f"{info.get('entropy',0):6.3f} │"
-                              f"{info.get('contrastive',0):6.3f} │"
-                              f"{info.get('total',0):6.3f}")
-                    gb += 1
-            print(f"  Time: {time.time()-t0:.1f}s")
+        print(f"\n  ┌── [{di+1}/{len(dom_seq)}] {dn} "
+              f"({[s for s,_,_ in slist]})")
 
-    # ── FIM only (no head, no augmentation) ──
-    elif cfg.tta_method == "fim":
-        model = (tent.configure_model_safe(model) if cfg.safe_bn else tent.configure_model(model))
-        tent.check_model(model)
-        params, _ = tent.collect_params(model)
-        opt = torch.optim.Adam(params, lr=cfg.tent_lr)
-        fim = tent.FIM(
-            model, opt,
-            fim_lambda=cfg.fim_lambda, fim_temp=cfg.fim_temp,
-            steps=cfg.tent_steps, episodic=cfg.tent_episodic)
-        print(f"[FIM] {len(params)} BN params "
-              f"({sum(p.numel() for p in params)} values)")
-        print(f"[FIM] λ={cfg.fim_lambda}, τ={cfg.fim_temp}")
-        print(f"[FIM] No classification head, no augmentation")
+        t0 = time.time()
+        tb = sum(len(l) for _, l, _ in slist)
 
-        for di, (dn, _, slist) in enumerate(dom_seq):
-            if cfg.tent_episodic: fim.reset()
-            tb = sum(len(l) for _, l, _ in slist)
-            t0 = time.time()
-            print(f"\n  [{di+1}/{len(dom_seq)}] {dn} "
-                  f"({[s for s,_,_ in slist]})")
-            print(f"  {'bat':>5} │{'spec':>6} │{'fim':>6} │{'total':>6}")
-            gb = 0
-            for sn, ld, _ in slist:
-                for imgs, _ in ld:
-                    _, info = fim(imgs.to(cfg.device))
-                    if gb < 5 or gb % 50 == 0 or gb == tb - 1:
-                        print(f"  {gb:5d} │{sn:>6s} │"
-                              f"{info.get('fim',0):6.3f} │"
-                              f"{info.get('total',0):6.3f}")
-                    gb += 1
-            print(f"  Time: {time.time()-t0:.1f}s")
-
-    # ── BNA ──
-    elif cfg.tta_method == "bna":
-        model = tent.configure_model_bna(model)
-        print(f"[BNA] BN running stats reset. Adapting via forward pass...")
-        for di, (dn, _, slist) in enumerate(dom_seq):
-            t0 = time.time()
-            print(f"\n  [{di+1}/{len(dom_seq)}] {dn} "
-                  f"({[s for s,_,_ in slist]})")
+        # ── Configure + Adapt ──
+        if cfg.tta_method == "bna":
+            model = tent.configure_model_bna(model)
             gb = 0
             for sn, ld, _ in slist:
                 for imgs, _ in ld:
                     tent.forward_bna(imgs.to(cfg.device), model)
                     gb += 1
-            print(f"  {gb} batches | Time: {time.time()-t0:.1f}s")
+            print(f"  │ {gb} batches (forward only)")
 
-    # ── CONTRASTIVE + Feature IM (no head) ──
-    elif cfg.tta_method == "contrastive_fim":
-        model = (tent.configure_model_safe(model) if cfg.safe_bn else tent.configure_model(model))
-        tent.check_model(model)
-        params, _ = tent.collect_params(model)
-        opt = torch.optim.Adam(params, lr=cfg.tent_lr)
-        aug_tf = tent.get_tta_augmentation(cfg.img_size)
-        cfim = tent.ContrastiveFIM(
-            model, opt, aug_tf,
-            contrastive_lambda=cfg.contrastive_lambda,
-            contrastive_temp=cfg.contrastive_temp,
-            fim_lambda=cfg.fim_lambda, fim_temp=cfg.fim_temp,
-            use_fft=cfg.use_fft_aug, fft_beta=cfg.fft_beta,
-            steps=cfg.tent_steps, episodic=cfg.tent_episodic)
-        print(f"[CONTRASTIVE_FIM] {len(params)} BN params "
-              f"({sum(p.numel() for p in params)} values)")
-        print(f"[CONTRASTIVE_FIM] λ_con={cfg.contrastive_lambda}, "
-              f"τ_con={cfg.contrastive_temp}")
-        print(f"[CONTRASTIVE_FIM] λ_fim={cfg.fim_lambda}, "
-              f"τ_fim={cfg.fim_temp}")
-        print(f"[CONTRASTIVE_FIM] FFT aug: {cfg.use_fft_aug}, "
-              f"β={cfg.fft_beta}")
-        print(f"[CONTRASTIVE_FIM] No classification head needed")
+        else:
+            model = (tent.configure_model_safe(model) if cfg.safe_bn
+                     else tent.configure_model(model))
+            params, _ = tent.collect_params(model)
+            opt = torch.optim.Adam(params, lr=cfg.tent_lr)
 
-        for di, (dn, _, slist) in enumerate(dom_seq):
-            if cfg.tent_episodic: cfim.reset()
-            tb = sum(len(l) for _, l, _ in slist)
-            t0 = time.time()
-            print(f"\n  [{di+1}/{len(dom_seq)}] {dn} "
-                  f"({[s for s,_,_ in slist]})")
-            print(f"  {'bat':>5} │{'spec':>6} │{'con':>6} │"
-                  f"{'fim':>6} │{'total':>6}")
+            if cfg.tta_method == "tent":
+                tta_obj = tent.Tent(model, opt, steps=cfg.tent_steps)
+                hdr = f"  │ {'bat':>5} │{'spec':>6} │{'H':>6}"
+
+            elif cfg.tta_method == "contrastive_em":
+                aug_tf = tent.get_tta_augmentation(cfg.img_size)
+                tta_obj = tent.ContrastiveTent(
+                    model, opt, aug_tf,
+                    contrastive_lambda=cfg.contrastive_lambda,
+                    contrastive_temp=cfg.contrastive_temp,
+                    steps=cfg.tent_steps, use_entropy=True,
+                    use_fft=cfg.use_fft_aug, fft_beta=cfg.fft_beta)
+                hdr = (f"  │ {'bat':>5} │{'spec':>6} │{'H':>6} │"
+                       f"{'con':>6} │{'total':>6}")
+
+            elif cfg.tta_method == "contrastive":
+                aug_tf = tent.get_tta_augmentation(cfg.img_size)
+                tta_obj = tent.ContrastiveTent(
+                    model, opt, aug_tf,
+                    contrastive_lambda=cfg.contrastive_lambda,
+                    contrastive_temp=cfg.contrastive_temp,
+                    steps=cfg.tent_steps, use_entropy=False,
+                    use_fft=cfg.use_fft_aug, fft_beta=cfg.fft_beta)
+                hdr = f"  │ {'bat':>5} │{'spec':>6} │{'con':>6} │{'total':>6}"
+
+            elif cfg.tta_method == "fim":
+                tta_obj = tent.FIM(
+                    model, opt,
+                    fim_lambda=cfg.fim_lambda, fim_temp=cfg.fim_temp,
+                    steps=cfg.tent_steps)
+                hdr = f"  │ {'bat':>5} │{'spec':>6} │{'fim':>6} │{'total':>6}"
+
+            elif cfg.tta_method == "contrastive_fim":
+                aug_tf = tent.get_tta_augmentation(cfg.img_size)
+                tta_obj = tent.ContrastiveFIM(
+                    model, opt, aug_tf,
+                    contrastive_lambda=cfg.contrastive_lambda,
+                    contrastive_temp=cfg.contrastive_temp,
+                    fim_lambda=cfg.fim_lambda, fim_temp=cfg.fim_temp,
+                    use_fft=cfg.use_fft_aug, fft_beta=cfg.fft_beta,
+                    steps=cfg.tent_steps)
+                hdr = (f"  │ {'bat':>5} │{'spec':>6} │{'con':>6} │"
+                       f"{'fim':>6} │{'total':>6}")
+
+            print(hdr)
             gb = 0
             for sn, ld, _ in slist:
                 for imgs, _ in ld:
-                    _, info = cfim(imgs.to(cfg.device))
-                    if gb < 5 or gb % 50 == 0 or gb == tb - 1:
-                        print(f"  {gb:5d} │{sn:>6s} │"
-                              f"{info.get('contrastive',0):6.3f} │"
-                              f"{info.get('fim',0):6.3f} │"
-                              f"{info.get('total',0):6.3f}")
-                    gb += 1
-            print(f"  Time: {time.time()-t0:.1f}s")
+                    out = tta_obj(imgs.to(cfg.device))
 
-    # ══════════════════════════════════════════════════════════
-    #  PHASE 5: Post-TTA eval
-    # ══════════════════════════════════════════════════════════
-    print(f"\n{'─'*70}")
-    print(f"  PHASE 5: Post-{method_label} Evaluation")
-    print(f"{'─'*70}")
-    model.eval()
-    post_tta = eval_test_spectrums(model, test_loaders, cfg,
-                                    tag=f"[post-{method_label}] ")
+                    if gb < 5 or gb % 50 == 0 or gb == tb - 1:
+                        if cfg.tta_method == "tent":
+                            logits = out
+                            H = tent.softmax_entropy(logits).mean().item()
+                            print(f"  │ {gb:5d} │{sn:>6s} │{H:6.3f}")
+                        else:
+                            _, info = out
+                            vals = []
+                            for k in ["entropy", "contrastive", "fim", "total"]:
+                                if k in info:
+                                    vals.append(f"{info[k]:6.3f}")
+                            print(f"  │ {gb:5d} │{sn:>6s} │{'│'.join(vals)}")
+                    gb += 1
+
+        elapsed = time.time() - t0
+        print(f"  │ Adapt: {elapsed:.1f}s")
+
+        # ── Evaluate this domain ──
+        model.eval()
+        for sn, ld, ds in slist:
+            gallery_idx, probe_idx = split_gallery_probe(
+                ds, cfg.gallery_ratio, cfg.seed)
+            all_idx = list(range(len(ds)))
+            feats, labels = extract_embeddings(
+                model, ds, all_idx, cfg.batch_size, cfg.device,
+                cfg.num_workers)
+            feats_t = feats.to(cfg.device)
+            ver = evaluate_verification(feats_t, labels, gallery_idx, probe_idx)
+            post_tta[sn] = ver
+
+            b = baseline.get(sn, {})
+            de = b.get("eer", 0) - ver["eer"]
+            dr = ver["rank1"] - b.get("rank1", 0)
+            print(f"  │ {sn}: EER {b.get('eer',-1):.2f}→{ver['eer']:.2f}% "
+                  f"({'↓' if de > 0 else '↑'}{abs(de):.2f}) | "
+                  f"R1 {b.get('rank1',-1):.2f}→{ver['rank1']:.2f}% "
+                  f"({'↑' if dr > 0 else '↓'}{abs(dr):.2f})")
+
+        print(f"  └── Reset for next domain")
 
     # ── Final comparison ──
     print(f"\n{'='*80}")
-    print(f"  FINAL COMPARISON ({method_label})")
+    print(f"  FINAL COMPARISON ({method_label}, episodic)")
     print(f"  Train IDs: {n_train_cls} | Test IDs: {n_test_cls}")
     print(f"  Source: {cfg.train_spectrums} | Target: "
           f"{[s for s,_,_ in test_loaders]}")
@@ -553,7 +505,8 @@ def adapt_casia_ms(cfg):
           f"{'↑' if dr > 0 else '↓'}{abs(dr):>6.2f}%")
 
     save_data = {
-        "tta_method": cfg.tta_method, "baseline": {k: dict(v) for k, v in baseline.items()},
+        "tta_method": cfg.tta_method, "episodic": True,
+        "baseline": {k: dict(v) for k, v in baseline.items()},
         "post_tta": {k: dict(v) for k, v in post_tta.items()},
         "n_train_ids": n_train_cls, "n_test_ids": n_test_cls,
         "train_spectrums": cfg.train_spectrums,

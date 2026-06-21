@@ -101,12 +101,13 @@ def get_cfg(args=None):
 
     # ─── TTA method & parameters ─────────────────────────────
     p.add_argument("--tta_method", default="tent",
-                   choices=["tent", "bna", "contrastive",
+                   choices=["tent", "bna", "contrastive", "contrastive_em",
                             "contrastive_fim", "fim"],
                    help="TTA method: "
                         "'tent' = entropy min on head_B, "
                         "'bna' = batch norm adaptation (no head), "
-                        "'contrastive' = entropy(head_B) + NT-Xent, "
+                        "'contrastive' = NT-Xent only (no head), "
+                        "'contrastive_em' = entropy(head_B) + NT-Xent, "
                         "'contrastive_fim' = NT-Xent + feature IM (no head), "
                         "'fim' = feature IM only (no head, no augmentation)")
     p.add_argument("--tent_lr", type=float, default=1e-3,
@@ -115,6 +116,12 @@ def get_cfg(args=None):
                    help="Gradient steps per batch (1=online TENT)")
     p.add_argument("--tent_episodic", action="store_true", default=False,
                    help="Reset BN params after each domain/spectrum")
+    p.add_argument("--safe_bn", action="store_true", default=True,
+                   help="Use safe BN config: preserve running stats instead "
+                        "of nulling them (recommended for small datasets / "
+                        "verification tasks). Use --no_safe_bn for original "
+                        "TENT behavior.")
+    p.add_argument("--no_safe_bn", dest="safe_bn", action="store_false")
     p.add_argument("--contrastive_lambda", type=float, default=1.0,
                    help="Weight of contrastive (NT-Xent) loss")
     p.add_argument("--contrastive_temp", type=float, default=0.5,

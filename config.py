@@ -110,7 +110,7 @@ def get_cfg(args=None):
                         "'contrastive_em' = entropy(head_B) + NT-Xent, "
                         "'contrastive_fim' = NT-Xent + feature IM (no head), "
                         "'fim' = feature IM only (no head, no augmentation)")
-    p.add_argument("--tent_lr", type=float, default=1e-3,
+    p.add_argument("--tent_lr", type=float, default=1e-4,
                    help="TENT learning rate for BN affine params")
     p.add_argument("--tent_steps", type=int, default=1,
                    help="Gradient steps per batch (1=online TENT)")

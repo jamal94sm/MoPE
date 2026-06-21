@@ -451,8 +451,11 @@ def feature_im_loss(z, temperature=0.1):
     Marginal entropy: overall distribution should be uniform
       → prevent collapse to a single cluster
 
+    Loss is clamped to non-negative: when clusters are already sharp
+    (H_cond < H_marg), no gradient is produced — don't fix what works.
+
     z: (B, D) embeddings
-    Returns: scalar loss = H_conditional - H_marginal
+    Returns: scalar loss = max(0, H_conditional - H_marginal)
     """
     z = F.normalize(z, dim=-1)
     sim = (z @ z.T) / temperature  # (B, B)
@@ -470,7 +473,10 @@ def feature_im_loss(z, temperature=0.1):
     p_marginal = p.mean(dim=0)
     H_marg = -(p_marginal * (p_marginal + 1e-8).log()).sum()
 
-    return H_cond - H_marg
+    # Clamp: if clusters are already good, produce no gradient
+    loss = F.relu(H_cond - H_marg)
+
+    return loss
 
 
 class ContrastiveFIM(nn.Module):

@@ -474,7 +474,8 @@ def feature_im_loss(z, temperature=0.1):
     H_marg = -(p_marginal * (p_marginal + 1e-8).log()).sum()
 
     # Clamp: if clusters are already good, produce no gradient
-    loss = F.relu(H_cond - H_marg)
+    #loss = F.relu(H_cond - H_marg)
+    loss = H_cond - H_marg
 
     return loss
 

@@ -180,6 +180,35 @@ def configure_model_bna(model):
     return model
 
 
+def configure_model_safe(model):
+    """
+    Configure model for gradient-based TTA on small datasets.
+
+    Unlike TENT's configure_model which nulls running stats (forcing
+    pure batch stats), this preserves running stats so they accumulate
+    from target data via EMA. At eval time, the adapted running stats
+    are used for consistent normalization.
+
+    1. Set entire model to train mode (BN uses batch stats + updates EMA)
+    2. Freeze all parameters
+    3. Re-enable gradients for BN affine params (γ, β)
+    4. KEEP running stats (don't null them)
+    """
+    model.train()
+    model.requires_grad_(False)
+
+    for m in model.modules():
+        if isinstance(m, (nn.BatchNorm2d, nn.BatchNorm1d)):
+            m.requires_grad_(True)
+            # Keep track_running_stats = True (default)
+            # Keep existing running_mean / running_var
+            # BN in train mode: uses batch stats for forward pass
+            #   AND updates running_mean/var via EMA
+            # At eval time: uses adapted running stats for consistency
+
+    return model
+
+
 @torch.no_grad()
 def forward_bna(x, model):
     """Forward pass for BNA. No gradients, just updates BN running stats."""

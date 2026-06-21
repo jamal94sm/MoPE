@@ -116,6 +116,11 @@ def get_cfg(args=None):
                    help="Gradient steps per batch (1=online TENT)")
     p.add_argument("--tent_episodic", action="store_true", default=False,
                    help="Reset BN params after each domain/spectrum")
+    p.add_argument("--reset_tta", action="store_true", default=True,
+                   help="Reset model before each target domain (episodic)")
+    p.add_argument("--no_reset_tta", dest="reset_tta", action="store_false",
+                   help="Continual: adapt sequentially, evaluate after each "
+                        "domain without resetting")
     p.add_argument("--safe_bn", action="store_true", default=True,
                    help="Use safe BN config: preserve running stats instead "
                         "of nulling them (recommended for small datasets / "

@@ -103,7 +103,7 @@ def get_cfg(args=None):
     p.add_argument("--tta_method", default="tent",
                    choices=["tent", "bna", "contrastive", "contrastive_em",
                             "contrastive_fim", "fim", "vicreg",
-                            "contrastive_nn"],
+                            "contrastive_nn", "contrastive_positive"],
                    help="TTA method: "
                         "'tent' = entropy min on head_B, "
                         "'bna' = batch norm adaptation (no head), "

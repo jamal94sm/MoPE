@@ -1,14 +1,12 @@
 """
-config.py — Configuration for TENT-based Test-Time Adaptation.
+config.py — Configuration for Test-Time Adaptation.
 
-Supports:
-  - ImageNet-C (classification) with ViT-Base / ResNet-50 / ResNet-100
-  - CASIA-MS (verification) with ArcFace iResNet100
+Modes: contrastive (NT-Xent), jepa (BYOL-style prediction)
+Datasets: ImageNet-C (classification), CASIA-MS (verification)
 """
 
-import argparse, math
+import argparse
 
-# ─── Corruption sequences ────────────────────────────────────────────
 IMAGENET_C_CORRUPTIONS = [
     "gaussian_noise", "shot_noise", "impulse_noise",
     "defocus_blur", "glass_blur", "motion_blur", "zoom_blur",
@@ -16,13 +14,12 @@ IMAGENET_C_CORRUPTIONS = [
     "contrast", "elastic_transform", "pixelate", "jpeg_compression",
 ]
 
-# ─── CASIA Multi-Spectral Palmprint ──────────────────────────────────
 CASIA_MS_SPECTRUMS = ["460", "630", "700", "850", "940", "WHT"]
 
 CASIA_ORACLE_DOMAINS = {
-    "visible": ["WHT", "460"],     # domain 0
-    "red_nir": ["630", "700"],     # domain 1
-    "nir":     ["850", "940"],     # domain 2
+    "visible": ["WHT", "460"],
+    "red_nir": ["630", "700"],
+    "nir":     ["850", "940"],
 }
 
 CASIA_ORACLE_LOOKUP = {}
@@ -32,144 +29,78 @@ for _gid, (_gname, _spectrums) in enumerate(CASIA_ORACLE_DOMAINS.items()):
 
 
 def get_cfg(args=None):
-    p = argparse.ArgumentParser(description="TENT Test-Time Adaptation")
+    p = argparse.ArgumentParser(description="Test-Time Adaptation")
 
     # ─── Dataset ──────────────────────────────────────────────
     p.add_argument("--dataset", default="imagenet_c",
                    choices=["imagenet_c", "casia_ms"])
     p.add_argument("--data_dir", default="./data/ImageNet-C")
     p.add_argument("--severity", type=int, default=5)
-    p.add_argument("--corruptions", nargs="*", default=None,
-                   help="Which corruptions to run (ImageNet-C). None=all 15.")
+    p.add_argument("--corruptions", nargs="*", default=None)
     p.add_argument("--batch_size", type=int, default=64)
     p.add_argument("--num_workers", type=int, default=4)
 
-    # ─── CASIA-MS specific ────────────────────────────────────
-    p.add_argument("--train_spectrums", nargs="*", default=["WHT"],
-                   help="Spectrums for training (source domain). "
-                        "Test spectrums = all remaining (target domain).")
-    p.add_argument("--test_id_ratio", type=float, default=0.5,
-                   help="Fraction of identities held out for testing. "
-                        "0.2 = 20%% test IDs, 80%% train IDs.")
-    p.add_argument("--gallery_ratio", type=float, default=0.1,
-                   help="Fraction of samples per ID for gallery (rest=probe)")
-    p.add_argument("--oracle_domains", action="store_true", default=False,
-                   help="Use oracle 3-group spectrum assignment for TENT")
+    # ─── CASIA-MS ─────────────────────────────────────────────
+    p.add_argument("--train_spectrums", nargs="*", default=["WHT"])
+    p.add_argument("--test_id_ratio", type=float, default=0.5)
+    p.add_argument("--gallery_ratio", type=float, default=0.1)
+    p.add_argument("--oracle_domains", action="store_true", default=False)
 
     # ─── ArcFace training ─────────────────────────────────────
-    p.add_argument("--arcface_epochs", type=int, default=20,
-                   help="Epochs to train backbone + train-ID head")
-    p.add_argument("--arcface_head_epochs", type=int, default=10,
-                   help="Epochs to train test-ID head (backbone frozen)")
-    p.add_argument("--arcface_lr", type=float, default=1e-4,
-                   help="Learning rate for Phase 1 (backbone + head_A)")
-    p.add_argument("--arcface_lr_phase2", type=float, default=1e-2,
-                   help="Learning rate for Phase 2 (test-ID head only)")
-    p.add_argument("--arcface_wd", type=float, default=5e-4,
-                   help="Weight decay for ArcFace training")
-    p.add_argument("--arcface_eval_every", type=int, default=5,
-                   help="Evaluate on test set every N epochs")
-    p.add_argument("--arcface_freeze_ratio", type=float, default=0.75,
-                   help="Fraction of backbone params to freeze during "
-                        "Phase 1 training. 0.75 = finetune last 25%%.")
+    p.add_argument("--arcface_epochs", type=int, default=20)
+    p.add_argument("--arcface_head_epochs", type=int, default=10)
+    p.add_argument("--arcface_lr", type=float, default=1e-4)
+    p.add_argument("--arcface_lr_phase2", type=float, default=1e-2)
+    p.add_argument("--arcface_wd", type=float, default=5e-4)
+    p.add_argument("--arcface_eval_every", type=int, default=5)
+    p.add_argument("--arcface_freeze_ratio", type=float, default=0.75)
+    p.add_argument("--arcface_m", type=float, default=0.50)
+    p.add_argument("--arcface_m_phase2", type=float, default=0.10)
+    p.add_argument("--arcface_s", type=float, default=64.0)
 
     # ─── Backbone ─────────────────────────────────────────────
     p.add_argument("--backbone", default="vit_base",
                    choices=["vit_base", "resnet50", "resnet101",
                             "arcface_r100"])
     p.add_argument("--arcface_onnx", type=str,
-                   default="/home/pai-ng/Jamal/NIPS2026/face_models/checkpoints/r100_glint360k.onnx",
-                   help="Path to ArcFace iResNet100 ONNX checkpoint")
-    p.add_argument("--arcface_ckpt", type=str, default=None,
-                   help="Path to trained ArcFace checkpoint (.pth) with "
-                        "model + arc state dicts. Required for TENT on "
-                        "CASIA-MS (provides classification head for entropy)")
-    p.add_argument("--arcface_num_classes", type=int, default=None,
-                   help="Number of identity classes for ArcFace head. "
-                        "Auto-detected from checkpoint if not set.")
-    p.add_argument("--arcface_s", type=float, default=64.0,
-                   help="ArcFace scale factor")
-    p.add_argument("--arcface_m", type=float, default=0.50,
-                   help="ArcFace angular margin for Phase 1 (backbone training)")
-    p.add_argument("--arcface_m_phase2", type=float, default=0.10,
-                   help="ArcFace angular margin for Phase 2 (test-ID head). "
-                        "Lower than Phase 1 since head trains on frozen backbone "
-                        "with fewer samples.")
-    p.add_argument("--num_classes", type=int, default=1000,
-                   help="Number of classes (ImageNet-C)")
+                   default="/home/pai-ng/Jamal/NIPS2026/face_models/"
+                           "checkpoints/r100_glint360k.onnx")
+    p.add_argument("--arcface_ckpt", type=str, default=None)
+    p.add_argument("--arcface_num_classes", type=int, default=None)
+    p.add_argument("--num_classes", type=int, default=1000)
     p.add_argument("--img_size", type=int, default=224)
 
-    # ─── TTA method & parameters ─────────────────────────────
-    p.add_argument("--tta_method", default="tent",
-                   choices=["tent", "bna", "contrastive", "contrastive_em",
-                            "contrastive_fim", "fim", "vicreg",
-                            "contrastive_nn", "contrastive_positive"],
-                   help="TTA method: "
-                        "'tent' = entropy min on head_B, "
-                        "'bna' = batch norm adaptation (no head), "
-                        "'contrastive' = NT-Xent only (no head), "
-                        "'contrastive_em' = entropy(head_B) + NT-Xent, "
-                        "'contrastive_fim' = NT-Xent + feature IM (no head), "
-                        "'fim' = feature IM only (no head), "
-                        "'vicreg' = variance + invariance + covariance (no head), "
-                        "'contrastive_nn' = NT-Xent + nearest-neighbor "
-                        "consistency (no head), "
-                        "'contrastive_positive' = positive-only MSE between "
-                        "augmented views (no negatives, no head)")
-    p.add_argument("--tent_lr", type=float, default=1e-4,
-                   help="TTA learning rate for BN affine params")
-    p.add_argument("--tent_steps", type=int, default=1,
-                   help="Gradient steps per batch (1=online TENT)")
-    p.add_argument("--tent_episodic", action="store_true", default=False,
-                   help="Reset BN params after each domain/spectrum")
+    # ─── TTA method ───────────────────────────────────────────
+    p.add_argument("--tta_method", default="contrastive",
+                   choices=["contrastive", "jepa"],
+                   help="'contrastive' = NT-Xent (no head), "
+                        "'jepa' = BYOL-style prediction (no head)")
+    p.add_argument("--tent_lr", type=float, default=1e-4)
+    p.add_argument("--tent_steps", type=int, default=1)
     p.add_argument("--reset_tta", action="store_true", default=False,
-                   help="Reset model before each target domain (episodic)")
-    p.add_argument("--no_reset_tta", dest="reset_tta", action="store_false",
-                   help="Continual: adapt sequentially (default)")
-    p.add_argument("--safe_bn", action="store_true", default=True,
-                   help="Use safe BN config: preserve running stats instead "
-                        "of nulling them (recommended for small datasets / "
-                        "verification tasks). Use --no_safe_bn for original "
-                        "TENT behavior.")
+                   help="Episodic: reset before each domain")
+    p.add_argument("--no_reset_tta", dest="reset_tta",
+                   action="store_false")
+    p.add_argument("--safe_bn", action="store_true", default=True)
     p.add_argument("--no_safe_bn", dest="safe_bn", action="store_false")
-    p.add_argument("--contrastive_lambda", type=float, default=1.0,
-                   help="Weight of contrastive (NT-Xent) loss")
-    p.add_argument("--contrastive_temp", type=float, default=0.5,
-                   help="Temperature for NT-Xent contrastive loss")
-    p.add_argument("--fim_lambda", type=float, default=1.0,
-                   help="Weight of feature IM loss (contrastive_fim mode)")
-    p.add_argument("--fim_temp", type=float, default=0.1,
-                   help="Temperature for feature IM neighborhood softmax")
-    p.add_argument("--use_fft_aug", action="store_true", default=True,
-                   help="Use FFT amplitude swap augmentation")
-    p.add_argument("--no_fft_aug", dest="use_fft_aug", action="store_false")
-    p.add_argument("--fft_beta", type=float, default=0.02,
-                   help="Fraction of low-frequency band to swap in FFT aug")
-    p.add_argument("--vicreg_var", type=float, default=1.0,
-                   help="VICReg: weight of variance term")
-    p.add_argument("--vicreg_inv", type=float, default=0.1,
-                   help="VICReg: weight of invariance term")
-    p.add_argument("--vicreg_cov", type=float, default=0.04,
-                   help="VICReg: weight of covariance term")
-    p.add_argument("--vicreg_gamma", type=float, default=1.0,
-                   help="VICReg: target std threshold for variance hinge")
-    p.add_argument("--vicreg_inv_mode", default="mse",
-                   choices=["mse", "ntxent"],
-                   help="VICReg invariance mode: "
-                        "'mse' = mean squared error (original VICReg), "
-                        "'ntxent' = NT-Xent contrastive (with negatives)")
-    p.add_argument("--vicreg_inv_temp", type=float, default=0.5,
-                   help="Temperature for NT-Xent when vicreg_inv_mode=ntxent")
-    p.add_argument("--nn_k", type=int, default=5,
-                   help="Number of nearest neighbors for NN consistency")
-    p.add_argument("--nn_lambda", type=float, default=1.0,
-                   help="Weight of nearest-neighbor consistency loss")
-    p.add_argument("--nn_temp", type=float, default=0.1,
-                   help="Temperature for NN consistency softmax")
 
-    # ─── Evaluation ───────────────────────────────────────────
-    p.add_argument("--eval_backbone", action="store_true", default=False,
-                   help="Evaluate frozen backbone before adaptation")
+    # ─── Contrastive params ───────────────────────────────────
+    p.add_argument("--contrastive_lambda", type=float, default=1.0)
+    p.add_argument("--contrastive_temp", type=float, default=0.5)
+
+    # ─── JEPA params ──────────────────────────────────────────
+    p.add_argument("--jepa_momentum", type=float, default=0.996,
+                   help="EMA momentum for teacher (0.99-0.999)")
+    p.add_argument("--jepa_pred_dim", type=int, default=256,
+                   help="Predictor MLP hidden dimension")
+    p.add_argument("--jepa_loss", default="smooth_l1",
+                   choices=["smooth_l1", "mse"])
+
+    # ─── Augmentation ─────────────────────────────────────────
+    p.add_argument("--use_fft_aug", action="store_true", default=True)
+    p.add_argument("--no_fft_aug", dest="use_fft_aug",
+                   action="store_false")
+    p.add_argument("--fft_beta", type=float, default=0.02)
 
     # ─── Misc ─────────────────────────────────────────────────
     p.add_argument("--seed", type=int, default=2025)
@@ -178,14 +109,13 @@ def get_cfg(args=None):
 
     cfg = p.parse_args(args)
 
-    # ── Auto-config ──
     if cfg.dataset == "casia_ms":
         cfg.is_verification = True
         if cfg.backbone != "arcface_r100":
-            print(f"[WARN] CASIA-MS requires arcface_r100 backbone, "
+            print(f"[WARN] CASIA-MS requires arcface_r100, "
                   f"overriding '{cfg.backbone}'")
             cfg.backbone = "arcface_r100"
-        cfg.img_size = 112  # InsightFace convention
+        cfg.img_size = 112
     else:
         cfg.is_verification = False
 

@@ -315,7 +315,7 @@ def adapt_casia_ms(cfg):
             print(f"\n  Loaded best Phase 2 head (epoch {ckpt['epoch']}, "
                   f"Rank-1={ckpt['rank1']:.2f}%)")
     else:
-        # bna, contrastive, contrastive_fim, fim need no head
+        # bna, contrastive, contrastive_fim, contrastive_nn, fim need no head
         print(f"\n{'─'*70}")
         print(f"  PHASE 2: SKIPPED ({method_label} needs no classification head)")
         print(f"{'─'*70}")
@@ -442,6 +442,19 @@ def adapt_casia_ms(cfg):
                 hdr = (f"  │ {'bat':>5} │{'spec':>6} │{'con':>6} │"
                        f"{'fim':>6} │{'total':>6}")
 
+            elif cfg.tta_method == "contrastive_nn":
+                aug_tf = tent.get_tta_augmentation_strong(cfg.img_size)
+                tta_obj = tent.ContrastiveNN(
+                    model, opt, aug_tf,
+                    contrastive_lambda=cfg.contrastive_lambda,
+                    contrastive_temp=cfg.contrastive_temp,
+                    nn_lambda=cfg.nn_lambda,
+                    nn_k=cfg.nn_k, nn_temp=cfg.nn_temp,
+                    use_fft=cfg.use_fft_aug, fft_beta=cfg.fft_beta,
+                    steps=cfg.tent_steps)
+                hdr = (f"  │ {'bat':>5} │{'spec':>6} │{'con':>6} │"
+                       f"{'nn':>6} │{'total':>6}")
+
             elif cfg.tta_method == "vicreg":
                 aug_tf = tent.get_tta_augmentation_strong(cfg.img_size)
                 tta_obj = tent.VICRegTTA(
@@ -472,7 +485,7 @@ def adapt_casia_ms(cfg):
                             _, info = out
                             vals = []
                             for k in ["entropy", "contrastive", "fim",
-                                      "var", "inv", "cov", "total"]:
+                                      "nn", "var", "inv", "cov", "total"]:
                                 if k in info:
                                     vals.append(f"{info[k]:6.3f}")
                                     vals.append(f"{info[k]:6.3f}")

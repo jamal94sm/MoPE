@@ -102,15 +102,16 @@ def get_cfg(args=None):
     # ─── TTA method & parameters ─────────────────────────────
     p.add_argument("--tta_method", default="tent",
                    choices=["tent", "bna", "contrastive", "contrastive_em",
-                            "contrastive_fim", "fim"],
+                            "contrastive_fim", "fim", "vicreg"],
                    help="TTA method: "
                         "'tent' = entropy min on head_B, "
                         "'bna' = batch norm adaptation (no head), "
                         "'contrastive' = NT-Xent only (no head), "
                         "'contrastive_em' = entropy(head_B) + NT-Xent, "
                         "'contrastive_fim' = NT-Xent + feature IM (no head), "
-                        "'fim' = feature IM only (no head, no augmentation)")
-    p.add_argument("--tent_lr", type=float, default=1e-4,
+                        "'fim' = feature IM only (no head), "
+                        "'vicreg' = variance + invariance + covariance (no head)")
+    p.add_argument("--tent_lr", type=float, default=1e-3,
                    help="TENT learning rate for BN affine params")
     p.add_argument("--tent_steps", type=int, default=1,
                    help="Gradient steps per batch (1=online TENT)")
@@ -140,6 +141,15 @@ def get_cfg(args=None):
     p.add_argument("--no_fft_aug", dest="use_fft_aug", action="store_false")
     p.add_argument("--fft_beta", type=float, default=0.2,
                    help="Fraction of low-frequency band to swap in FFT aug")
+    p.add_argument("--vicreg_var", type=float, default=1.0,
+                   help="VICReg: weight of variance term")
+    p.add_argument("--vicreg_inv", type=float, default=1.0,
+                   help="VICReg: weight of invariance term")
+    p.add_argument("--vicreg_cov", type=float, default=0.04,
+                   help="VICReg: weight of covariance term "
+                        "(original paper uses 1/25 relative to others)")
+    p.add_argument("--vicreg_gamma", type=float, default=1.0,
+                   help="VICReg: target std threshold for variance hinge")
 
     # ─── Evaluation ───────────────────────────────────────────
     p.add_argument("--eval_backbone", action="store_true", default=False,

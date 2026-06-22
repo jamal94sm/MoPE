@@ -145,6 +145,13 @@ class ArcFaceBackbone(nn.Module):
             out = out[0]
         return F.normalize(out, p=2, dim=1)
 
+    def forward_raw(self, x):
+        """Return embeddings BEFORE L2 normalization."""
+        out = self.net(x)
+        if isinstance(out, (list, tuple)):
+            out = out[0]
+        return out
+
     @property
     def embedding_dim(self):
         return 512
@@ -207,6 +214,10 @@ class ArcFaceModel(nn.Module):
     def get_embeddings(self, x):
         """For verification: extract L2-normalized embeddings."""
         return self.backbone(x)
+
+    def get_raw_embeddings(self, x):
+        """For VICReg: extract embeddings BEFORE L2 normalization."""
+        return self.backbone.forward_raw(x)
 
     def forward(self, x):
         """For TENT: returns logits without margin."""

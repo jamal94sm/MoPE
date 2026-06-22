@@ -442,6 +442,19 @@ def adapt_casia_ms(cfg):
                 hdr = (f"  │ {'bat':>5} │{'spec':>6} │{'con':>6} │"
                        f"{'fim':>6} │{'total':>6}")
 
+            elif cfg.tta_method == "vicreg":
+                aug_tf = tent.get_tta_augmentation(cfg.img_size)
+                tta_obj = tent.VICRegTTA(
+                    model, opt, aug_tf,
+                    lambda_var=cfg.vicreg_var,
+                    lambda_inv=cfg.vicreg_inv,
+                    lambda_cov=cfg.vicreg_cov,
+                    gamma=cfg.vicreg_gamma,
+                    use_fft=cfg.use_fft_aug, fft_beta=cfg.fft_beta,
+                    steps=cfg.tent_steps)
+                hdr = (f"  │ {'bat':>5} │{'spec':>6} │{'var':>6} │"
+                       f"{'inv':>6} │{'cov':>6} │{'total':>6}")
+
             print(hdr)
             gb = 0
             for sn, ld, _ in slist:
@@ -456,8 +469,10 @@ def adapt_casia_ms(cfg):
                         else:
                             _, info = out
                             vals = []
-                            for k in ["entropy", "contrastive", "fim", "total"]:
+                            for k in ["entropy", "contrastive", "fim",
+                                      "var", "inv", "cov", "total"]:
                                 if k in info:
+                                    vals.append(f"{info[k]:6.3f}")
                                     vals.append(f"{info[k]:6.3f}")
                             print(f"  │ {gb:5d} │{sn:>6s} │{'│'.join(vals)}")
                     gb += 1

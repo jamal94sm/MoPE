@@ -751,6 +751,82 @@ class ContrastiveNN(nn.Module):
                                 self.model_state, self.optimizer_state)
 
 
+class ContrastivePositive(nn.Module):
+    """
+    Positive-only contrastive: MSE between original and augmented views.
+
+    Loss = ||z_orig - z_aug||²
+
+    No negatives — eliminates false negative problem where same-identity
+    samples are pushed apart. Will collapse without additional regularization.
+    This is a baseline to measure the false-negative impact of NT-Xent.
+
+    No classification head needed.
+    """
+    def __init__(self, model, optimizer, aug_transform,
+                 inv_lambda=1.0, use_fft=True, fft_beta=0.02,
+                 steps=1, episodic=False):
+        super().__init__()
+        self.model = model
+        self.optimizer = optimizer
+        self.aug_transform = aug_transform
+        self.inv_lambda = inv_lambda
+        self.use_fft = use_fft
+        self.fft_beta = fft_beta
+        self.steps = steps
+        self.episodic = episodic
+        assert steps > 0
+
+        self.model_state, self.optimizer_state = \
+            copy_model_and_optimizer(self.model, self.optimizer)
+
+    def _get_embeddings(self, x):
+        """Get raw embeddings (before L2 norm)."""
+        if hasattr(self.model, 'get_raw_embeddings'):
+            return self.model.get_raw_embeddings(x)
+        elif hasattr(self.model, 'backbone') and hasattr(self.model.backbone, 'forward_raw'):
+            return self.model.backbone.forward_raw(x)
+        elif hasattr(self.model, 'get_embeddings'):
+            return self.model.get_embeddings(x)
+        else:
+            return self.model(x)
+
+    def forward(self, x):
+        if self.episodic:
+            self.reset()
+        for _ in range(self.steps):
+            outputs, info = self._adapt(x)
+        return outputs, info
+
+    @torch.enable_grad()
+    def _adapt(self, x):
+        z_orig = self._get_embeddings(x)
+
+        x_aug = augment_batch(x, self.aug_transform,
+                              use_fft=self.use_fft, fft_beta=self.fft_beta)
+        z_aug = self._get_embeddings(x_aug)
+
+        inv_loss = F.mse_loss(z_orig, z_aug)
+        total = self.inv_lambda * inv_loss
+
+        info = {
+            "inv": inv_loss.item(),
+            "total": total.item(),
+        }
+
+        total.backward()
+        self.optimizer.step()
+        self.optimizer.zero_grad()
+
+        return z_orig.detach(), info
+
+    def reset(self):
+        if self.model_state is None or self.optimizer_state is None:
+            raise Exception("cannot reset without saved state")
+        load_model_and_optimizer(self.model, self.optimizer,
+                                self.model_state, self.optimizer_state)
+
+
 # ══════════════════════════════════════════════════════════════
 #  VICReg: Variance-Invariance-Covariance Regularization
 #  Bardes et al., ICLR 2022

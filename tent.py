@@ -764,13 +764,15 @@ class ContrastivePositive(nn.Module):
     No classification head needed.
     """
     def __init__(self, model, optimizer, aug_transform,
-                 inv_lambda=1.0, use_fft=True, fft_beta=0.02,
+                 inv_lambda=1.0, temperature=0.5,
+                 use_fft=True, fft_beta=0.02,
                  steps=1, episodic=False):
         super().__init__()
         self.model = model
         self.optimizer = optimizer
         self.aug_transform = aug_transform
         self.inv_lambda = inv_lambda
+        self.temperature = temperature
         self.use_fft = use_fft
         self.fft_beta = fft_beta
         self.steps = steps
@@ -806,11 +808,18 @@ class ContrastivePositive(nn.Module):
                               use_fft=self.use_fft, fft_beta=self.fft_beta)
         z_aug = self._get_embeddings(x_aug)
 
-        inv_loss = F.mse_loss(z_orig, z_aug)
+        # Positive-only contrastive: attraction term of NT-Xent
+        # L = -sim(z, z_aug) / τ  (no negative denominator)
+        z_orig_n = F.normalize(z_orig, dim=-1)
+        z_aug_n = F.normalize(z_aug, dim=-1)
+        pos_sim = (z_orig_n * z_aug_n).sum(dim=-1)  # (B,)
+        inv_loss = -(pos_sim / self.temperature).mean()
+
         total = self.inv_lambda * inv_loss
 
         info = {
             "inv": inv_loss.item(),
+            "sim": pos_sim.mean().item(),
             "total": total.item(),
         }
 

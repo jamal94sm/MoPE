@@ -102,7 +102,8 @@ def get_cfg(args=None):
     # ─── TTA method & parameters ─────────────────────────────
     p.add_argument("--tta_method", default="tent",
                    choices=["tent", "bna", "contrastive", "contrastive_em",
-                            "contrastive_fim", "fim", "vicreg"],
+                            "contrastive_fim", "fim", "vicreg",
+                            "contrastive_nn"],
                    help="TTA method: "
                         "'tent' = entropy min on head_B, "
                         "'bna' = batch norm adaptation (no head), "
@@ -110,7 +111,9 @@ def get_cfg(args=None):
                         "'contrastive_em' = entropy(head_B) + NT-Xent, "
                         "'contrastive_fim' = NT-Xent + feature IM (no head), "
                         "'fim' = feature IM only (no head), "
-                        "'vicreg' = variance + invariance + covariance (no head)")
+                        "'vicreg' = variance + invariance + covariance (no head), "
+                        "'contrastive_nn' = NT-Xent + nearest-neighbor "
+                        "consistency (no head)")
     p.add_argument("--tent_lr", type=float, default=1e-4,
                    help="TTA learning rate for BN affine params")
     p.add_argument("--tent_steps", type=int, default=1,
@@ -144,7 +147,7 @@ def get_cfg(args=None):
                    help="VICReg: weight of variance term")
     p.add_argument("--vicreg_inv", type=float, default=0.1,
                    help="VICReg: weight of invariance term")
-    p.add_argument("--vicreg_cov", type=float, default=0.1,
+    p.add_argument("--vicreg_cov", type=float, default=0.04,
                    help="VICReg: weight of covariance term")
     p.add_argument("--vicreg_gamma", type=float, default=1.0,
                    help="VICReg: target std threshold for variance hinge")
@@ -155,6 +158,12 @@ def get_cfg(args=None):
                         "'ntxent' = NT-Xent contrastive (with negatives)")
     p.add_argument("--vicreg_inv_temp", type=float, default=0.5,
                    help="Temperature for NT-Xent when vicreg_inv_mode=ntxent")
+    p.add_argument("--nn_k", type=int, default=5,
+                   help="Number of nearest neighbors for NN consistency")
+    p.add_argument("--nn_lambda", type=float, default=1.0,
+                   help="Weight of nearest-neighbor consistency loss")
+    p.add_argument("--nn_temp", type=float, default=0.1,
+                   help="Temperature for NN consistency softmax")
 
     # ─── Evaluation ───────────────────────────────────────────
     p.add_argument("--eval_backbone", action="store_true", default=False,

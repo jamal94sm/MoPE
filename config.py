@@ -111,17 +111,16 @@ def get_cfg(args=None):
                         "'contrastive_fim' = NT-Xent + feature IM (no head), "
                         "'fim' = feature IM only (no head), "
                         "'vicreg' = variance + invariance + covariance (no head)")
-    p.add_argument("--tent_lr", type=float, default=1e-3,
-                   help="TENT learning rate for BN affine params")
+    p.add_argument("--tent_lr", type=float, default=1e-4,
+                   help="TTA learning rate for BN affine params")
     p.add_argument("--tent_steps", type=int, default=1,
                    help="Gradient steps per batch (1=online TENT)")
     p.add_argument("--tent_episodic", action="store_true", default=False,
                    help="Reset BN params after each domain/spectrum")
-    p.add_argument("--reset_tta", action="store_true", default=True,
+    p.add_argument("--reset_tta", action="store_true", default=False,
                    help="Reset model before each target domain (episodic)")
     p.add_argument("--no_reset_tta", dest="reset_tta", action="store_false",
-                   help="Continual: adapt sequentially, evaluate after each "
-                        "domain without resetting")
+                   help="Continual: adapt sequentially (default)")
     p.add_argument("--safe_bn", action="store_true", default=True,
                    help="Use safe BN config: preserve running stats instead "
                         "of nulling them (recommended for small datasets / "
@@ -143,13 +142,19 @@ def get_cfg(args=None):
                    help="Fraction of low-frequency band to swap in FFT aug")
     p.add_argument("--vicreg_var", type=float, default=1.0,
                    help="VICReg: weight of variance term")
-    p.add_argument("--vicreg_inv", type=float, default=1.0,
+    p.add_argument("--vicreg_inv", type=float, default=0.1,
                    help="VICReg: weight of invariance term")
     p.add_argument("--vicreg_cov", type=float, default=0.04,
-                   help="VICReg: weight of covariance term "
-                        "(original paper uses 1/25 relative to others)")
+                   help="VICReg: weight of covariance term")
     p.add_argument("--vicreg_gamma", type=float, default=1.0,
                    help="VICReg: target std threshold for variance hinge")
+    p.add_argument("--vicreg_inv_mode", default="mse",
+                   choices=["mse", "ntxent"],
+                   help="VICReg invariance mode: "
+                        "'mse' = mean squared error (original VICReg), "
+                        "'ntxent' = NT-Xent contrastive (with negatives)")
+    p.add_argument("--vicreg_inv_temp", type=float, default=0.5,
+                   help="Temperature for NT-Xent when vicreg_inv_mode=ntxent")
 
     # ─── Evaluation ───────────────────────────────────────────
     p.add_argument("--eval_backbone", action="store_true", default=False,

@@ -460,10 +460,11 @@ def adapt_casia_ms(cfg):
                 tta_obj = tent.ContrastivePositive(
                     model, opt, aug_tf,
                     inv_lambda=cfg.contrastive_lambda,
+                    temperature=cfg.contrastive_temp,
                     use_fft=cfg.use_fft_aug, fft_beta=cfg.fft_beta,
                     steps=cfg.tent_steps)
                 hdr = (f"  │ {'bat':>5} │{'spec':>6} │{'inv':>6} │"
-                       f"{'total':>6}")
+                       f"{'sim':>6} │{'total':>6}")
 
             elif cfg.tta_method == "vicreg":
                 aug_tf = tent.get_tta_augmentation_strong(cfg.img_size)
@@ -495,7 +496,8 @@ def adapt_casia_ms(cfg):
                             _, info = out
                             vals = []
                             for k in ["entropy", "contrastive", "fim",
-                                      "nn", "var", "inv", "cov", "total"]:
+                                      "nn", "inv", "sim",
+                                      "var", "cov", "total"]:
                                 if k in info:
                                     vals.append(f"{info[k]:6.3f}")
                                     vals.append(f"{info[k]:6.3f}")

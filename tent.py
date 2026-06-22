@@ -389,10 +389,13 @@ class ContrastiveTent(nn.Module):
 
     @torch.enable_grad()
     def _get_embeddings(self, x):
-        if hasattr(self.model, 'get_embeddings'):
+        """Get raw embeddings (before L2 norm) for contrastive loss."""
+        if hasattr(self.model, 'get_raw_embeddings'):
+            return self.model.get_raw_embeddings(x)
+        elif hasattr(self.model, 'backbone') and hasattr(self.model.backbone, 'forward_raw'):
+            return self.model.backbone.forward_raw(x)
+        elif hasattr(self.model, 'get_embeddings'):
             return self.model.get_embeddings(x)
-        elif hasattr(self.model, 'backbone'):
-            return self.model.backbone(x)
         else:
             return self.model(x)
 

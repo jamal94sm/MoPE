@@ -472,7 +472,7 @@ def feature_im_loss(z, temperature=0.1):
     p_marginal = p.mean(dim=0)
     H_marg = -(p_marginal * (p_marginal + 1e-8).log()).sum()
 
-    return F.relu(H_cond - H_marg)
+    return H_cond - H_marg
 
 
 class ContrastiveFIM(nn.Module):
@@ -610,6 +610,157 @@ class FIM(nn.Module):
         self.optimizer.step()
         self.optimizer.zero_grad()
         return z.detach(), info
+
+    def reset(self):
+        if self.model_state is None or self.optimizer_state is None:
+            raise Exception("cannot reset without saved state")
+        load_model_and_optimizer(self.model, self.optimizer,
+                                self.model_state, self.optimizer_state)
+
+# ══════════════════════════════════════════════════════════════
+#  VICReg: Variance-Invariance-Covariance Regularization
+#  Bardes et al., ICLR 2022
+# ══════════════════════════════════════════════════════════════
+
+def vicreg_variance_loss(z, gamma=1.0, eps=1e-4):
+    """
+    Variance term: hinge loss on per-dimension standard deviation.
+    Ensures each embedding dimension has std >= gamma.
+    Stops naturally when variance is high enough (no over-optimization).
+
+    z: (B, D) embeddings
+    gamma: target std threshold (default 1.0)
+    Returns: scalar loss
+    """
+    std = torch.sqrt(z.var(dim=0) + eps)  # (D,)
+    return F.relu(gamma - std).mean()
+
+
+def vicreg_covariance_loss(z):
+    """
+    Covariance term: minimize off-diagonal entries of the covariance matrix.
+    Decorrelates embedding dimensions to prevent information redundancy.
+
+    z: (B, D) embeddings
+    Returns: scalar loss
+    """
+    B, D = z.shape
+    z_centered = z - z.mean(dim=0)
+    cov = (z_centered.T @ z_centered) / (B - 1)  # (D, D)
+    # Zero out diagonal (we don't penalize self-variance)
+    off_diag = cov.pow(2)
+    mask = ~torch.eye(D, device=z.device).bool()
+    return off_diag[mask].mean()
+
+
+def vicreg_invariance_loss(z1, z2):
+    """
+    Invariance term: MSE between original and augmented embeddings.
+    Simpler than NT-Xent — no negatives, no temperature.
+
+    z1, z2: (B, D) embeddings (original, augmented)
+    Returns: scalar loss
+    """
+    return F.mse_loss(z1, z2)
+
+
+def vicreg_loss(z1, z2, lambda_var=1.0, lambda_inv=1.0, lambda_cov=1.0,
+                gamma=1.0):
+    """
+    Combined VICReg loss.
+
+    z1: original embeddings (B, D)
+    z2: augmented embeddings (B, D)
+
+    Returns: total_loss, info dict
+    """
+    var_loss = (vicreg_variance_loss(z1, gamma) +
+                vicreg_variance_loss(z2, gamma)) / 2
+    inv_loss = vicreg_invariance_loss(z1, z2)
+    cov_loss = (vicreg_covariance_loss(z1) +
+                vicreg_covariance_loss(z2)) / 2
+
+    total = (lambda_var * var_loss +
+             lambda_inv * inv_loss +
+             lambda_cov * cov_loss)
+
+    info = {
+        "var": var_loss.item(),
+        "inv": inv_loss.item(),
+        "cov": cov_loss.item(),
+        "total": total.item(),
+    }
+    return total, info
+
+
+class VICRegTTA(nn.Module):
+    """
+    VICReg-based Test-Time Adaptation.
+
+    Loss = λ_var * Variance + λ_inv * Invariance + λ_cov * Covariance
+
+    - Variance: hinge on per-dim std → stops when each dim has enough spread
+    - Invariance: MSE(z_orig, z_aug) → augmentation consistency
+    - Covariance: decorrelate dims → prevent redundant features
+
+    No classification head needed. Each term has natural stopping behavior.
+    """
+    def __init__(self, model, optimizer, aug_transform,
+                 lambda_var=1.0, lambda_inv=1.0, lambda_cov=1.0,
+                 gamma=1.0, use_fft=False, fft_beta=0.5,
+                 steps=1, episodic=False):
+        super().__init__()
+        self.model = model
+        self.optimizer = optimizer
+        self.aug_transform = aug_transform
+        self.lambda_var = lambda_var
+        self.lambda_inv = lambda_inv
+        self.lambda_cov = lambda_cov
+        self.gamma = gamma
+        self.use_fft = use_fft
+        self.fft_beta = fft_beta
+        self.steps = steps
+        self.episodic = episodic
+        assert steps > 0
+
+        self.model_state, self.optimizer_state = \
+            copy_model_and_optimizer(self.model, self.optimizer)
+
+    def _get_embeddings(self, x):
+        if hasattr(self.model, 'get_embeddings'):
+            return self.model.get_embeddings(x)
+        elif hasattr(self.model, 'backbone'):
+            return self.model.backbone(x)
+        else:
+            return self.model(x)
+
+    def forward(self, x):
+        if self.episodic:
+            self.reset()
+        for _ in range(self.steps):
+            outputs, info = self._adapt(x)
+        return outputs, info
+
+    @torch.enable_grad()
+    def _adapt(self, x):
+        z_orig = self._get_embeddings(x)
+
+        x_aug = augment_batch(x, self.aug_transform,
+                              use_fft=self.use_fft, fft_beta=self.fft_beta)
+        z_aug = self._get_embeddings(x_aug)
+
+        total, info = vicreg_loss(
+            z_orig, z_aug,
+            lambda_var=self.lambda_var,
+            lambda_inv=self.lambda_inv,
+            lambda_cov=self.lambda_cov,
+            gamma=self.gamma)
+
+        total.backward()
+        self.optimizer.step()
+        self.optimizer.zero_grad()
+
+        return z_orig.detach(), info
 
     def reset(self):
         if self.model_state is None or self.optimizer_state is None:

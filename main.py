@@ -315,7 +315,7 @@ def adapt_casia_ms(cfg):
             print(f"\n  Loaded best Phase 2 head (epoch {ckpt['epoch']}, "
                   f"Rank-1={ckpt['rank1']:.2f}%)")
     else:
-        # bna, contrastive, contrastive_fim, contrastive_nn, fim need no head
+        # bna, contrastive, contrastive_fim, contrastive_nn, contrastive_positive, fim need no head
         print(f"\n{'─'*70}")
         print(f"  PHASE 2: SKIPPED ({method_label} needs no classification head)")
         print(f"{'─'*70}")
@@ -454,6 +454,16 @@ def adapt_casia_ms(cfg):
                     steps=cfg.tent_steps)
                 hdr = (f"  │ {'bat':>5} │{'spec':>6} │{'con':>6} │"
                        f"{'nn':>6} │{'total':>6}")
+
+            elif cfg.tta_method == "contrastive_positive":
+                aug_tf = tent.get_tta_augmentation_strong(cfg.img_size)
+                tta_obj = tent.ContrastivePositive(
+                    model, opt, aug_tf,
+                    inv_lambda=cfg.contrastive_lambda,
+                    use_fft=cfg.use_fft_aug, fft_beta=cfg.fft_beta,
+                    steps=cfg.tent_steps)
+                hdr = (f"  │ {'bat':>5} │{'spec':>6} │{'inv':>6} │"
+                       f"{'total':>6}")
 
             elif cfg.tta_method == "vicreg":
                 aug_tf = tent.get_tta_augmentation_strong(cfg.img_size)

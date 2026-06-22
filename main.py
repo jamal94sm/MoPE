@@ -449,7 +449,7 @@ def adapt_casia_ms(cfg):
                     contrastive_lambda=cfg.contrastive_lambda,
                     contrastive_temp=cfg.contrastive_temp,
                     nn_lambda=cfg.nn_lambda,
-                    nn_k=cfg.nn_k, nn_temp=cfg.nn_temp,
+                    nn_temp=cfg.nn_temp,
                     use_fft=cfg.use_fft_aug, fft_beta=cfg.fft_beta,
                     steps=cfg.tent_steps)
                 hdr = (f"  │ {'bat':>5} │{'spec':>6} │{'con':>6} │"

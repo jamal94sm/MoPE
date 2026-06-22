@@ -72,9 +72,11 @@ def get_cfg(args=None):
 
     # ─── TTA method ───────────────────────────────────────────
     p.add_argument("--tta_method", default="contrastive",
-                   choices=["contrastive", "jepa"],
-                   help="'contrastive' = NT-Xent (no head), "
-                        "'jepa' = BYOL-style prediction (no head)")
+                   choices=["contrastive", "jepa", "jepa_joint", "jepa_con"],
+                   help="'contrastive' = NT-Xent, "
+                        "'jepa' = 3-phase (ArcFace → warmup → TTA), "
+                        "'jepa_joint' = joint ArcFace+JEPA Phase 1 → TTA, "
+                        "'jepa_con' = NT-Xent + JEPA at TTA time")
     p.add_argument("--tent_lr", type=float, default=1e-4)
     p.add_argument("--tent_steps", type=int, default=1)
     p.add_argument("--reset_tta", action="store_true", default=False,
@@ -99,6 +101,9 @@ def get_cfg(args=None):
                    help="Epochs to warm up predictor on source (Phase 1.5)")
     p.add_argument("--jepa_train_lambda", type=float, default=1.0,
                    help="Weight of JEPA loss during Phase 1 joint training")
+    p.add_argument("--jepa_con_lambda", type=float, default=1.0,
+                   help="Weight of contrastive loss in jepa_con mode "
+                        "(JEPA weight uses jepa_train_lambda)")
 
     # ─── Augmentation ─────────────────────────────────────────
     p.add_argument("--use_fft_aug", action="store_true", default=True)

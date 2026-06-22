@@ -134,10 +134,14 @@ def adapt_casia_ms(cfg):
     n_test_cls = len(test_id_map)
 
     # ══════════════════════════════════════════════════════════
-    #  PHASE 1: Train backbone
+    #  PHASE 1: Train backbone (+ JEPA predictor if jepa mode)
     # ══════════════════════════════════════════════════════════
     print(f"\n{'─'*70}")
-    print(f"  PHASE 1: Train backbone + head_A ({n_train_cls} classes)")
+    if cfg.tta_method == "jepa":
+        print(f"  PHASE 1: Train backbone + head_A + JEPA predictor")
+        print(f"  Loss = ArcFace + {cfg.jepa_train_lambda} × JEPA")
+    else:
+        print(f"  PHASE 1: Train backbone + head_A ({n_train_cls} classes)")
     print(f"{'─'*70}")
 
     cfg.arcface_num_classes = n_train_cls
@@ -149,19 +153,101 @@ def adapt_casia_ms(cfg):
     print(f"[Phase 1] {n_unfrozen} unfrozen backbone tensors + "
           f"head_A ({n_train_cls}×512)")
 
-    ckpt1 = os.path.join(cfg.output_dir, "phase1_best.pth")
-    train_arcface(model, backbone_train_loader, train_params, cfg,
-                  cfg.arcface_epochs, "P1", ckpt_path=ckpt1)
+    # JEPA components (created during Phase 1, reused in Phase 4)
+    warm_predictor_state = None
 
-    if os.path.exists(ckpt1):
-        ckpt = torch.load(ckpt1, map_location=cfg.device, weights_only=False)
-        model.backbone.load_state_dict(ckpt["backbone"])
-        print(f"\n  Loaded best Phase 1 backbone (epoch {ckpt['epoch']})")
+    if cfg.tta_method == "jepa":
+        from copy import deepcopy
+        emb_dim = 512
+        jepa_predictor = tent.PredictorMLP(
+            emb_dim, cfg.jepa_pred_dim, emb_dim).to(cfg.device)
+        jepa_teacher = deepcopy(model)
+        jepa_teacher.requires_grad_(False)
+        jepa_teacher.eval()
+
+        jepa_loss_fn = (F.smooth_l1_loss if cfg.jepa_loss == "smooth_l1"
+                        else F.mse_loss)
+        jepa_aug = tent.get_tta_augmentation(cfg.img_size)
+
+        train_params += list(jepa_predictor.parameters())
+        print(f"[Phase 1] + JEPA predictor: "
+              f"{sum(p.numel() for p in jepa_predictor.parameters())} params | "
+              f"EMA: {cfg.jepa_momentum}")
+
+    # Training loop
+    optimizer = torch.optim.AdamW(train_params, lr=cfg.arcface_lr,
+                                   weight_decay=cfg.arcface_wd)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=cfg.arcface_epochs, eta_min=1e-6)
+    ce_loss = nn.CrossEntropyLoss()
+    ckpt1 = os.path.join(cfg.output_dir, "phase1_best.pth")
+    best_rank1 = 0.0
+
+    model.train()
+    for epoch in range(1, cfg.arcface_epochs + 1):
+        ep_loss = 0.0; ep_arc = 0.0; ep_jepa = 0.0
+        ep_corr = 0; ep_tot = 0; n_bat = 0
+
+        for imgs, labels in backbone_train_loader:
+            imgs, labels = imgs.to(cfg.device), labels.to(cfg.device)
+            optimizer.zero_grad()
+
+            # ArcFace loss
+            logits = model.train_forward(imgs, labels)
+            loss_arc = ce_loss(logits, labels)
+            total_loss = loss_arc
+
+            # JEPA loss (joint training)
+            if cfg.tta_method == "jepa":
+                z_s = model.get_raw_embeddings(imgs)
+                with torch.no_grad():
+                    x_aug = tent.augment_batch(
+                        imgs, jepa_aug,
+                        use_fft=cfg.use_fft_aug, fft_beta=cfg.fft_beta)
+                    z_t = jepa_teacher.get_raw_embeddings(x_aug)
+                z_p = jepa_predictor(z_s)
+                loss_jepa = jepa_loss_fn(z_p, z_t)
+                total_loss = total_loss + cfg.jepa_train_lambda * loss_jepa
+                ep_jepa += loss_jepa.item()
+
+            total_loss.backward()
+            torch.nn.utils.clip_grad_norm_(train_params, 5.0)
+            optimizer.step()
+
+            # EMA teacher update
+            if cfg.tta_method == "jepa":
+                with torch.no_grad():
+                    tent.ema_update(model, jepa_teacher, cfg.jepa_momentum)
+
+            ep_arc += loss_arc.item()
+            with torch.no_grad():
+                ep_corr += (logits.argmax(1) == labels).sum().item()
+                ep_tot += labels.shape[0]
+            n_bat += 1
+
+        scheduler.step()
+        acc = 100.0 * ep_corr / max(ep_tot, 1)
+        ts = time.strftime("%H:%M:%S")
+        if cfg.tta_method == "jepa":
+            print(f"  [{ts}] P1 ep {epoch:03d}/{cfg.arcface_epochs}  "
+                  f"arc={ep_arc/n_bat:.4f}  jepa={ep_jepa/n_bat:.4f}  "
+                  f"acc={acc:.2f}%")
+        else:
+            print(f"  [{ts}] P1 ep {epoch:03d}/{cfg.arcface_epochs}  "
+                  f"loss={ep_arc/n_bat:.4f}  acc={acc:.2f}%")
+
+    # Save warm predictor state
+    if cfg.tta_method == "jepa":
+        warm_predictor_state = deepcopy(jepa_predictor.state_dict())
+        with torch.no_grad():
+            sim = F.cosine_similarity(z_p, z_t, dim=-1).mean().item()
+        print(f"\n  JEPA predictor trained: sim={sim:.3f}")
+
+    model.backbone.requires_grad_(False)
 
     # ══════════════════════════════════════════════════════════
     #  PHASE 3: Baseline eval
     # ══════════════════════════════════════════════════════════
-    model.backbone.requires_grad_(False)
     print(f"\n{'─'*70}")
     print(f"  PHASE 3: Pre-TTA Baseline")
     print(f"{'─'*70}")
@@ -217,6 +303,9 @@ def adapt_casia_ms(cfg):
             emb_dim = 512
             predictor = tent.PredictorMLP(
                 emb_dim, cfg.jepa_pred_dim, emb_dim).to(cfg.device)
+            if warm_predictor_state is not None:
+                predictor.load_state_dict(warm_predictor_state)
+                print(f"[JEPA] Loaded warm predictor from Phase 1.5")
             opt = torch.optim.Adam([
                 {"params": bn_params, "lr": cfg.tent_lr},
                 {"params": predictor.parameters(), "lr": cfg.tent_lr * 10},
@@ -251,6 +340,8 @@ def adapt_casia_ms(cfg):
                 emb_dim = 512
                 predictor = tent.PredictorMLP(
                     emb_dim, cfg.jepa_pred_dim, emb_dim).to(cfg.device)
+                if warm_predictor_state is not None:
+                    predictor.load_state_dict(warm_predictor_state)
                 opt = torch.optim.Adam([
                     {"params": bn_params, "lr": cfg.tent_lr},
                     {"params": predictor.parameters(),

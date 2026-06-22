@@ -95,6 +95,10 @@ def get_cfg(args=None):
                    help="Predictor MLP hidden dimension")
     p.add_argument("--jepa_loss", default="smooth_l1",
                    choices=["smooth_l1", "mse"])
+    p.add_argument("--jepa_warmup_epochs", type=int, default=0,
+                   help="Epochs to warm up predictor on source (Phase 1.5)")
+    p.add_argument("--jepa_train_lambda", type=float, default=1.0,
+                   help="Weight of JEPA loss during Phase 1 joint training")
 
     # ─── Augmentation ─────────────────────────────────────────
     p.add_argument("--use_fft_aug", action="store_true", default=True)

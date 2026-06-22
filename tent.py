@@ -693,17 +693,36 @@ def vicreg_loss(z1, z2, lambda_var=1.0, lambda_inv=1.0, lambda_cov=1.0,
     return total, info
 
 
+def get_tta_augmentation_strong(img_size=112):
+    """
+    Stronger augmentation for VICReg TTA.
+    Needs enough variation to make invariance term useful.
+    """
+    return transforms.Compose([
+        transforms.RandomResizedCrop(img_size, scale=(0.7, 1.0),
+                                      ratio=(0.9, 1.1)),
+        transforms.RandomApply([
+            transforms.ColorJitter(brightness=0.3, contrast=0.3,
+                                    saturation=0.1, hue=0.05),
+        ], p=0.7),
+        transforms.RandomApply([
+            transforms.GaussianBlur(kernel_size=5, sigma=(0.1, 1.0)),
+        ], p=0.5),
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.RandomApply([
+            transforms.RandomRotation(15),
+        ], p=0.3),
+    ])
+
+
 class VICRegTTA(nn.Module):
     """
     VICReg-based Test-Time Adaptation.
 
+    Uses RAW embeddings (before L2 normalization) so that variance
+    and covariance terms operate on the natural scale of features.
+
     Loss = λ_var * Variance + λ_inv * Invariance + λ_cov * Covariance
-
-    - Variance: hinge on per-dim std → stops when each dim has enough spread
-    - Invariance: MSE(z_orig, z_aug) → augmentation consistency
-    - Covariance: decorrelate dims → prevent redundant features
-
-    No classification head needed. Each term has natural stopping behavior.
     """
     def __init__(self, model, optimizer, aug_transform,
                  lambda_var=1.0, lambda_inv=1.0, lambda_cov=1.0,
@@ -726,11 +745,14 @@ class VICRegTTA(nn.Module):
         self.model_state, self.optimizer_state = \
             copy_model_and_optimizer(self.model, self.optimizer)
 
-    def _get_embeddings(self, x):
-        if hasattr(self.model, 'get_embeddings'):
+    def _get_raw_embeddings(self, x):
+        """Get embeddings BEFORE L2 normalization for VICReg."""
+        if hasattr(self.model, 'get_raw_embeddings'):
+            return self.model.get_raw_embeddings(x)
+        elif hasattr(self.model, 'backbone') and hasattr(self.model.backbone, 'forward_raw'):
+            return self.model.backbone.forward_raw(x)
+        elif hasattr(self.model, 'get_embeddings'):
             return self.model.get_embeddings(x)
-        elif hasattr(self.model, 'backbone'):
-            return self.model.backbone(x)
         else:
             return self.model(x)
 
@@ -743,11 +765,11 @@ class VICRegTTA(nn.Module):
 
     @torch.enable_grad()
     def _adapt(self, x):
-        z_orig = self._get_embeddings(x)
+        z_orig = self._get_raw_embeddings(x)
 
         x_aug = augment_batch(x, self.aug_transform,
                               use_fft=self.use_fft, fft_beta=self.fft_beta)
-        z_aug = self._get_embeddings(x_aug)
+        z_aug = self._get_raw_embeddings(x_aug)
 
         total, info = vicreg_loss(
             z_orig, z_aug,

@@ -57,7 +57,7 @@ def get_cfg(args=None):
                    help="Use oracle 3-group spectrum assignment for TENT")
 
     # ─── ArcFace training ─────────────────────────────────────
-    p.add_argument("--arcface_epochs", type=int, default=50,
+    p.add_argument("--arcface_epochs", type=int, default=20,
                    help="Epochs to train backbone + train-ID head")
     p.add_argument("--arcface_head_epochs", type=int, default=10,
                    help="Epochs to train test-ID head (backbone frozen)")
@@ -113,7 +113,9 @@ def get_cfg(args=None):
                         "'fim' = feature IM only (no head), "
                         "'vicreg' = variance + invariance + covariance (no head), "
                         "'contrastive_nn' = NT-Xent + nearest-neighbor "
-                        "consistency (no head)")
+                        "consistency (no head), "
+                        "'contrastive_positive' = positive-only MSE between "
+                        "augmented views (no negatives, no head)")
     p.add_argument("--tent_lr", type=float, default=1e-4,
                    help="TTA learning rate for BN affine params")
     p.add_argument("--tent_steps", type=int, default=1,
@@ -188,4 +190,3 @@ def get_cfg(args=None):
         cfg.is_verification = False
 
     return cfg
-  

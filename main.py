@@ -134,11 +134,11 @@ def adapt_casia_ms(cfg):
     n_test_cls = len(test_id_map)
 
     # ══════════════════════════════════════════════════════════
-    #  PHASE 1: Train backbone (+ JEPA predictor if jepa mode)
+    #  PHASE 1: Train backbone (+ JEPA if jepa_joint mode)
     # ══════════════════════════════════════════════════════════
     print(f"\n{'─'*70}")
-    if cfg.tta_method == "jepa":
-        print(f"  PHASE 1: Train backbone + head_A + JEPA predictor")
+    if cfg.tta_method == "jepa_joint":
+        print(f"  PHASE 1: Train backbone + head_A + JEPA predictor (joint)")
         print(f"  Loss = ArcFace + {cfg.jepa_train_lambda} × JEPA")
     else:
         print(f"  PHASE 1: Train backbone + head_A ({n_train_cls} classes)")
@@ -156,7 +156,7 @@ def adapt_casia_ms(cfg):
     # JEPA components (created during Phase 1, reused in Phase 4)
     warm_predictor_state = None
 
-    if cfg.tta_method == "jepa":
+    if cfg.tta_method == "jepa_joint":
         from copy import deepcopy
         emb_dim = 512
         jepa_predictor = tent.PredictorMLP(
@@ -198,7 +198,7 @@ def adapt_casia_ms(cfg):
             total_loss = loss_arc
 
             # JEPA loss (joint training)
-            if cfg.tta_method == "jepa":
+            if cfg.tta_method == "jepa_joint":
                 z_s = model.get_raw_embeddings(imgs)
                 with torch.no_grad():
                     x_aug = tent.augment_batch(
@@ -215,7 +215,7 @@ def adapt_casia_ms(cfg):
             optimizer.step()
 
             # EMA teacher update
-            if cfg.tta_method == "jepa":
+            if cfg.tta_method == "jepa_joint":
                 with torch.no_grad():
                     tent.ema_update(model, jepa_teacher, cfg.jepa_momentum)
 
@@ -228,7 +228,7 @@ def adapt_casia_ms(cfg):
         scheduler.step()
         acc = 100.0 * ep_corr / max(ep_tot, 1)
         ts = time.strftime("%H:%M:%S")
-        if cfg.tta_method == "jepa":
+        if cfg.tta_method == "jepa_joint":
             print(f"  [{ts}] P1 ep {epoch:03d}/{cfg.arcface_epochs}  "
                   f"arc={ep_arc/n_bat:.4f}  jepa={ep_jepa/n_bat:.4f}  "
                   f"acc={acc:.2f}%")
@@ -237,13 +237,82 @@ def adapt_casia_ms(cfg):
                   f"loss={ep_arc/n_bat:.4f}  acc={acc:.2f}%")
 
     # Save warm predictor state
-    if cfg.tta_method == "jepa":
+    if cfg.tta_method == "jepa_joint":
         warm_predictor_state = deepcopy(jepa_predictor.state_dict())
         with torch.no_grad():
             sim = F.cosine_similarity(z_p, z_t, dim=-1).mean().item()
         print(f"\n  JEPA predictor trained: sim={sim:.3f}")
 
     model.backbone.requires_grad_(False)
+
+    # ══════════════════════════════════════════════════════════
+    #  PHASE 2: JEPA warm-up (jepa / jepa_con modes)
+    #  Frozen backbone, train only predictor + EMA teacher
+    # ══════════════════════════════════════════════════════════
+    if cfg.tta_method in ("jepa", "jepa_con") and cfg.jepa_warmup_epochs > 0:
+        print(f"\n{'─'*70}")
+        print(f"  PHASE 2: JEPA predictor warm-up on source")
+        print(f"  {cfg.jepa_warmup_epochs} epochs, backbone FROZEN")
+        print(f"{'─'*70}")
+
+        from copy import deepcopy
+        emb_dim = 512
+
+        warm_predictor = tent.PredictorMLP(
+            emb_dim, cfg.jepa_pred_dim, emb_dim).to(cfg.device)
+        warm_teacher = deepcopy(model)
+        warm_teacher.requires_grad_(False)
+        warm_teacher.eval()
+
+        jepa_loss_fn = (F.smooth_l1_loss if cfg.jepa_loss == "smooth_l1"
+                        else F.mse_loss)
+        aug_tf = tent.get_tta_augmentation(cfg.img_size)
+
+        warmup_opt = torch.optim.Adam(warm_predictor.parameters(),
+                                       lr=cfg.tent_lr * 10)
+
+        def _get_raw(mdl, x):
+            if hasattr(mdl, 'get_raw_embeddings'):
+                return mdl.get_raw_embeddings(x)
+            elif hasattr(mdl, 'backbone') and \
+                    hasattr(mdl.backbone, 'forward_raw'):
+                return mdl.backbone.forward_raw(x)
+            return mdl.get_embeddings(x)
+
+        model.eval()
+        for ep in range(1, cfg.jepa_warmup_epochs + 1):
+            ep_loss = 0.0; n_bat = 0
+            for imgs, _ in backbone_train_loader:
+                imgs = imgs.to(cfg.device)
+                with torch.no_grad():
+                    z_s = _get_raw(model, imgs)
+                    x_aug = tent.augment_batch(
+                        imgs, aug_tf,
+                        use_fft=cfg.use_fft_aug, fft_beta=cfg.fft_beta)
+                    z_t = _get_raw(warm_teacher, x_aug)
+
+                z_p = warm_predictor(z_s)
+                loss = jepa_loss_fn(z_p, z_t)
+
+                warmup_opt.zero_grad()
+                loss.backward()
+                warmup_opt.step()
+
+                with torch.no_grad():
+                    tent.ema_update(model, warm_teacher, cfg.jepa_momentum)
+
+                ep_loss += loss.item()
+                n_bat += 1
+
+            with torch.no_grad():
+                sim = F.cosine_similarity(z_p, z_t, dim=-1).mean().item()
+                p_std = z_p.std(dim=0).mean().item()
+            print(f"  [Warm-up] ep {ep:02d}/{cfg.jepa_warmup_epochs}  "
+                  f"loss={ep_loss/n_bat:.4f}  sim={sim:.3f}  "
+                  f"p_std={p_std:.3f}")
+
+        warm_predictor_state = deepcopy(warm_predictor.state_dict())
+        print(f"  Predictor ready: sim={sim:.3f}")
 
     # ══════════════════════════════════════════════════════════
     #  PHASE 3: Baseline eval
@@ -299,13 +368,13 @@ def adapt_casia_ms(cfg):
                 steps=cfg.tent_steps)
             print(f"[CONTRASTIVE] {len(bn_params)} BN params")
 
-        elif cfg.tta_method == "jepa":
+        elif cfg.tta_method in ("jepa", "jepa_joint"):
             emb_dim = 512
             predictor = tent.PredictorMLP(
                 emb_dim, cfg.jepa_pred_dim, emb_dim).to(cfg.device)
             if warm_predictor_state is not None:
                 predictor.load_state_dict(warm_predictor_state)
-                print(f"[JEPA] Loaded warm predictor from Phase 1.5")
+                print(f"[{method_label}] Loaded warm predictor")
             opt = torch.optim.Adam([
                 {"params": bn_params, "lr": cfg.tent_lr},
                 {"params": predictor.parameters(), "lr": cfg.tent_lr * 10},
@@ -315,9 +384,32 @@ def adapt_casia_ms(cfg):
                 momentum=cfg.jepa_momentum, loss_fn=cfg.jepa_loss,
                 use_fft=cfg.use_fft_aug, fft_beta=cfg.fft_beta,
                 steps=cfg.tent_steps)
-            print(f"[JEPA] {len(bn_params)} BN params | "
+            print(f"[{method_label}] {len(bn_params)} BN params | "
                   f"Predictor: {sum(p.numel() for p in predictor.parameters())} | "
                   f"EMA: {cfg.jepa_momentum}")
+
+        elif cfg.tta_method == "jepa_con":
+            emb_dim = 512
+            predictor = tent.PredictorMLP(
+                emb_dim, cfg.jepa_pred_dim, emb_dim).to(cfg.device)
+            if warm_predictor_state is not None:
+                predictor.load_state_dict(warm_predictor_state)
+                print(f"[JEPA_CON] Loaded warm predictor")
+            opt = torch.optim.Adam([
+                {"params": bn_params, "lr": cfg.tent_lr},
+                {"params": predictor.parameters(), "lr": cfg.tent_lr * 10},
+            ])
+            tta_obj = tent.JEPAContrastive(
+                model, opt, aug_tf, predictor,
+                con_lambda=cfg.jepa_con_lambda,
+                con_temp=cfg.contrastive_temp,
+                jepa_lambda=cfg.jepa_train_lambda,
+                momentum=cfg.jepa_momentum, loss_fn=cfg.jepa_loss,
+                use_fft=cfg.use_fft_aug, fft_beta=cfg.fft_beta,
+                steps=cfg.tent_steps)
+            print(f"[JEPA_CON] {len(bn_params)} BN params | "
+                  f"Predictor: {sum(p.numel() for p in predictor.parameters())} | "
+                  f"λ_con={cfg.jepa_con_lambda} λ_jepa={cfg.jepa_train_lambda}")
 
     for di, (dn, _, slist) in enumerate(dom_seq):
         if cfg.reset_tta:
@@ -336,7 +428,7 @@ def adapt_casia_ms(cfg):
                     use_fft=cfg.use_fft_aug, fft_beta=cfg.fft_beta,
                     steps=cfg.tent_steps)
 
-            elif cfg.tta_method == "jepa":
+            elif cfg.tta_method in ("jepa", "jepa_joint"):
                 emb_dim = 512
                 predictor = tent.PredictorMLP(
                     emb_dim, cfg.jepa_pred_dim, emb_dim).to(cfg.device)
@@ -353,6 +445,26 @@ def adapt_casia_ms(cfg):
                     use_fft=cfg.use_fft_aug, fft_beta=cfg.fft_beta,
                     steps=cfg.tent_steps)
 
+            elif cfg.tta_method == "jepa_con":
+                emb_dim = 512
+                predictor = tent.PredictorMLP(
+                    emb_dim, cfg.jepa_pred_dim, emb_dim).to(cfg.device)
+                if warm_predictor_state is not None:
+                    predictor.load_state_dict(warm_predictor_state)
+                opt = torch.optim.Adam([
+                    {"params": bn_params, "lr": cfg.tent_lr},
+                    {"params": predictor.parameters(),
+                     "lr": cfg.tent_lr * 10},
+                ])
+                tta_obj = tent.JEPAContrastive(
+                    model, opt, aug_tf, predictor,
+                    con_lambda=cfg.jepa_con_lambda,
+                    con_temp=cfg.contrastive_temp,
+                    jepa_lambda=cfg.jepa_train_lambda,
+                    momentum=cfg.jepa_momentum, loss_fn=cfg.jepa_loss,
+                    use_fft=cfg.use_fft_aug, fft_beta=cfg.fft_beta,
+                    steps=cfg.tent_steps)
+
         print(f"\n  ┌── [{di+1}/{len(dom_seq)}] {dn} "
               f"({[s for s,_,_ in slist]})")
 
@@ -361,6 +473,9 @@ def adapt_casia_ms(cfg):
 
         if cfg.tta_method == "contrastive":
             print(f"  │ {'bat':>5} │{'spec':>6} │{'con':>6} │{'total':>6}")
+        elif cfg.tta_method == "jepa_con":
+            print(f"  │ {'bat':>5} │{'spec':>6} │{'con':>6} │"
+                  f"{'jepa':>6} │{'sim':>6} │{'total':>6}")
         else:
             print(f"  │ {'bat':>5} │{'spec':>6} │{'loss':>6} │"
                   f"{'sim':>6} │{'p_std':>6} │{'t_std':>6}")
@@ -373,6 +488,10 @@ def adapt_casia_ms(cfg):
                     if cfg.tta_method == "contrastive":
                         print(f"  │ {gb:5d} │{sn:>6s} │"
                               f"{info['con']:6.3f} │{info['total']:6.3f}")
+                    elif cfg.tta_method == "jepa_con":
+                        print(f"  │ {gb:5d} │{sn:>6s} │"
+                              f"{info['con']:6.3f} │{info['jepa']:6.3f} │"
+                              f"{info['sim']:6.3f} │{info['total']:6.3f}")
                     else:
                         print(f"  │ {gb:5d} │{sn:>6s} │"
                               f"{info['loss']:6.3f} │{info['sim']:6.3f} │"

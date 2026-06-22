@@ -621,6 +621,141 @@ class FIM(nn.Module):
                                 self.model_state, self.optimizer_state)
 
 # ══════════════════════════════════════════════════════════════
+#  Nearest-Neighbor Consistency
+# ══════════════════════════════════════════════════════════════
+
+def nn_consistency_loss(z, k=5, temperature=0.1):
+    """
+    Nearest-neighbor consistency loss (within batch).
+
+    For each sample, find K nearest neighbors among other samples
+    in the batch. The similarity distribution over neighbors should
+    be sharp — push each sample toward its natural cluster.
+
+    z: (B, D) embeddings
+    k: number of nearest neighbors
+    temperature: softmax temperature
+
+    Returns: scalar loss (lower = tighter clusters)
+    """
+    z = F.normalize(z, dim=-1)
+    B = z.shape[0]
+    k = min(k, B - 1)  # can't have more neighbors than batch - 1
+
+    # Pairwise cosine similarity
+    sim = (z @ z.T) / temperature  # (B, B)
+
+    # Mask self-similarity
+    mask = torch.eye(B, device=z.device).bool()
+    sim.masked_fill_(mask, -1e9)
+
+    # Find top-K nearest neighbors per sample
+    topk_sim, topk_idx = sim.topk(k, dim=-1)  # (B, K)
+
+    # Softmax over K neighbors → neighborhood distribution
+    p_nn = F.softmax(topk_sim, dim=-1)  # (B, K)
+
+    # Entropy of neighborhood distribution — minimize to sharpen
+    # Low entropy = confident about which neighbors are closest
+    H_nn = -(p_nn * (p_nn + 1e-8).log()).sum(dim=-1).mean()
+
+    return H_nn
+
+
+class ContrastiveNN(nn.Module):
+    """
+    Contrastive + Nearest-Neighbor Consistency.
+
+    Loss = λ_con * NT-Xent(z, z_aug) + λ_nn * NN_consistency(z)
+
+    NT-Xent: augmentation invariance with negatives
+    NN consistency: push samples toward their K nearest neighbors
+                    → tighter identity clusters without labels
+
+    No classification head needed.
+    """
+    def __init__(self, model, optimizer, aug_transform,
+                 contrastive_lambda=1.0, contrastive_temp=0.5,
+                 nn_lambda=1.0, nn_k=5, nn_temp=0.1,
+                 use_fft=True, fft_beta=0.02,
+                 steps=1, episodic=False):
+        super().__init__()
+        self.model = model
+        self.optimizer = optimizer
+        self.aug_transform = aug_transform
+        self.contrastive_lambda = contrastive_lambda
+        self.contrastive_temp = contrastive_temp
+        self.nn_lambda = nn_lambda
+        self.nn_k = nn_k
+        self.nn_temp = nn_temp
+        self.use_fft = use_fft
+        self.fft_beta = fft_beta
+        self.steps = steps
+        self.episodic = episodic
+        assert steps > 0
+
+        self.model_state, self.optimizer_state = \
+            copy_model_and_optimizer(self.model, self.optimizer)
+
+    def _get_embeddings(self, x):
+        """Get raw embeddings (before L2 norm)."""
+        if hasattr(self.model, 'get_raw_embeddings'):
+            return self.model.get_raw_embeddings(x)
+        elif hasattr(self.model, 'backbone') and hasattr(self.model.backbone, 'forward_raw'):
+            return self.model.backbone.forward_raw(x)
+        elif hasattr(self.model, 'get_embeddings'):
+            return self.model.get_embeddings(x)
+        else:
+            return self.model(x)
+
+    def forward(self, x):
+        if self.episodic:
+            self.reset()
+        for _ in range(self.steps):
+            outputs, info = self._adapt(x)
+        return outputs, info
+
+    @torch.enable_grad()
+    def _adapt(self, x):
+        # Original embeddings
+        z_orig = self._get_embeddings(x)
+
+        # Augmented embeddings
+        x_aug = augment_batch(x, self.aug_transform,
+                              use_fft=self.use_fft, fft_beta=self.fft_beta)
+        z_aug = self._get_embeddings(x_aug)
+
+        info = {}
+        total_loss = torch.tensor(0.0, device=x.device)
+
+        # NT-Xent contrastive (on normalized embeddings)
+        con_loss = nt_xent_loss(F.normalize(z_orig, dim=-1),
+                                F.normalize(z_aug, dim=-1),
+                                self.contrastive_temp)
+        total_loss = total_loss + self.contrastive_lambda * con_loss
+        info["contrastive"] = con_loss.item()
+
+        # NN consistency (on original embeddings)
+        nn_loss = nn_consistency_loss(z_orig, k=self.nn_k, temperature=self.nn_temp)
+        total_loss = total_loss + self.nn_lambda * nn_loss
+        info["nn"] = nn_loss.item()
+
+        info["total"] = total_loss.item()
+
+        total_loss.backward()
+        self.optimizer.step()
+        self.optimizer.zero_grad()
+
+        return z_orig.detach(), info
+
+    def reset(self):
+        if self.model_state is None or self.optimizer_state is None:
+            raise Exception("cannot reset without saved state")
+        load_model_and_optimizer(self.model, self.optimizer,
+                                self.model_state, self.optimizer_state)
+
+
+# ══════════════════════════════════════════════════════════════
 #  VICReg: Variance-Invariance-Covariance Regularization
 #  Bardes et al., ICLR 2022
 # ══════════════════════════════════════════════════════════════

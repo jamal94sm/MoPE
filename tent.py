@@ -624,23 +624,24 @@ class FIM(nn.Module):
 #  Nearest-Neighbor Consistency
 # ══════════════════════════════════════════════════════════════
 
-def nn_consistency_loss(z, k=5, temperature=0.1):
+def nn_consistency_loss(z, temperature=0.1):
     """
-    Nearest-neighbor consistency loss (within batch).
+    Nearest-neighbor consistency loss over ALL samples in batch.
 
-    For each sample, find K nearest neighbors among other samples
-    in the batch. The similarity distribution over neighbors should
-    be sharp — push each sample toward its natural cluster.
+    For each sample, compute similarity distribution over all other
+    samples via softmax, then minimize its entropy. This pushes each
+    sample to be strongly similar to some samples (same identity)
+    and dissimilar to others (different identity) — creating natural
+    clusters without specifying K.
+
+    L = -Σ_i Σ_j p_ij * log(p_ij)   where p_ij = softmax(sim/τ)
 
     z: (B, D) embeddings
-    k: number of nearest neighbors
-    temperature: softmax temperature
-
-    Returns: scalar loss (lower = tighter clusters)
+    temperature: softmax temperature (lower = sharper)
+    Returns: scalar loss (mean entropy over all samples)
     """
     z = F.normalize(z, dim=-1)
     B = z.shape[0]
-    k = min(k, B - 1)  # can't have more neighbors than batch - 1
 
     # Pairwise cosine similarity
     sim = (z @ z.T) / temperature  # (B, B)
@@ -649,17 +650,13 @@ def nn_consistency_loss(z, k=5, temperature=0.1):
     mask = torch.eye(B, device=z.device).bool()
     sim.masked_fill_(mask, -1e9)
 
-    # Find top-K nearest neighbors per sample
-    topk_sim, topk_idx = sim.topk(k, dim=-1)  # (B, K)
+    # Softmax → probability distribution over other samples
+    p = F.softmax(sim, dim=-1)  # (B, B)
 
-    # Softmax over K neighbors → neighborhood distribution
-    p_nn = F.softmax(topk_sim, dim=-1)  # (B, K)
+    # Entropy per sample → minimize
+    H = -(p * (p + 1e-8).log()).sum(dim=-1).mean()
 
-    # Entropy of neighborhood distribution — minimize to sharpen
-    # Low entropy = confident about which neighbors are closest
-    H_nn = -(p_nn * (p_nn + 1e-8).log()).sum(dim=-1).mean()
-
-    return H_nn
+    return H
 
 
 class ContrastiveNN(nn.Module):
@@ -676,7 +673,7 @@ class ContrastiveNN(nn.Module):
     """
     def __init__(self, model, optimizer, aug_transform,
                  contrastive_lambda=1.0, contrastive_temp=0.5,
-                 nn_lambda=1.0, nn_k=5, nn_temp=0.1,
+                 nn_lambda=1.0, nn_temp=0.1,
                  use_fft=True, fft_beta=0.02,
                  steps=1, episodic=False):
         super().__init__()
@@ -686,7 +683,6 @@ class ContrastiveNN(nn.Module):
         self.contrastive_lambda = contrastive_lambda
         self.contrastive_temp = contrastive_temp
         self.nn_lambda = nn_lambda
-        self.nn_k = nn_k
         self.nn_temp = nn_temp
         self.use_fft = use_fft
         self.fft_beta = fft_beta
@@ -736,7 +732,7 @@ class ContrastiveNN(nn.Module):
         info["contrastive"] = con_loss.item()
 
         # NN consistency (on original embeddings)
-        nn_loss = nn_consistency_loss(z_orig, k=self.nn_k, temperature=self.nn_temp)
+        nn_loss = nn_consistency_loss(z_orig, temperature=self.nn_temp)
         total_loss = total_loss + self.nn_lambda * nn_loss
         info["nn"] = nn_loss.item()
 

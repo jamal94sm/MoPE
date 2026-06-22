@@ -57,7 +57,7 @@ def get_cfg(args=None):
                    help="Use oracle 3-group spectrum assignment for TENT")
 
     # ─── ArcFace training ─────────────────────────────────────
-    p.add_argument("--arcface_epochs", type=int, default=100,
+    p.add_argument("--arcface_epochs", type=int, default=20,
                    help="Epochs to train backbone + train-ID head")
     p.add_argument("--arcface_head_epochs", type=int, default=10,
                    help="Epochs to train test-ID head (backbone frozen)")

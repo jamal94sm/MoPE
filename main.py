@@ -450,6 +450,8 @@ def adapt_casia_ms(cfg):
                     lambda_inv=cfg.vicreg_inv,
                     lambda_cov=cfg.vicreg_cov,
                     gamma=cfg.vicreg_gamma,
+                    inv_mode=cfg.vicreg_inv_mode,
+                    inv_temp=cfg.vicreg_inv_temp,
                     use_fft=cfg.use_fft_aug, fft_beta=cfg.fft_beta,
                     steps=cfg.tent_steps)
                 hdr = (f"  │ {'bat':>5} │{'spec':>6} │{'var':>6} │"

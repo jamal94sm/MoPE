@@ -664,19 +664,27 @@ def vicreg_invariance_loss(z1, z2):
     return F.mse_loss(z1, z2)
 
 
-def vicreg_loss(z1, z2, lambda_var=1.0, lambda_inv=1.0, lambda_cov=1.0,
-                gamma=1.0):
+def vicreg_loss(z1, z2, lambda_var=1.0, lambda_inv=0.1, lambda_cov=0.04,
+                gamma=1.0, inv_mode="mse", inv_temp=0.5):
     """
     Combined VICReg loss.
 
-    z1: original embeddings (B, D)
-    z2: augmented embeddings (B, D)
+    z1: original embeddings (B, D) — raw, before L2 norm
+    z2: augmented embeddings (B, D) — raw, before L2 norm
+    inv_mode: 'mse' (original VICReg) or 'ntxent' (contrastive with negatives)
 
     Returns: total_loss, info dict
     """
     var_loss = (vicreg_variance_loss(z1, gamma) +
                 vicreg_variance_loss(z2, gamma)) / 2
-    inv_loss = vicreg_invariance_loss(z1, z2)
+
+    if inv_mode == "ntxent":
+        # NT-Xent on L2-normalized versions (contrastive needs unit sphere)
+        inv_loss = nt_xent_loss(F.normalize(z1, dim=-1),
+                                F.normalize(z2, dim=-1), inv_temp)
+    else:
+        inv_loss = vicreg_invariance_loss(z1, z2)
+
     cov_loss = (vicreg_covariance_loss(z1) +
                 vicreg_covariance_loss(z2)) / 2
 
@@ -725,8 +733,9 @@ class VICRegTTA(nn.Module):
     Loss = λ_var * Variance + λ_inv * Invariance + λ_cov * Covariance
     """
     def __init__(self, model, optimizer, aug_transform,
-                 lambda_var=1.0, lambda_inv=1.0, lambda_cov=1.0,
-                 gamma=1.0, use_fft=False, fft_beta=0.5,
+                 lambda_var=1.0, lambda_inv=0.1, lambda_cov=0.04,
+                 gamma=1.0, inv_mode="mse", inv_temp=0.5,
+                 use_fft=False, fft_beta=0.5,
                  steps=1, episodic=False):
         super().__init__()
         self.model = model
@@ -736,6 +745,8 @@ class VICRegTTA(nn.Module):
         self.lambda_inv = lambda_inv
         self.lambda_cov = lambda_cov
         self.gamma = gamma
+        self.inv_mode = inv_mode
+        self.inv_temp = inv_temp
         self.use_fft = use_fft
         self.fft_beta = fft_beta
         self.steps = steps
@@ -776,7 +787,9 @@ class VICRegTTA(nn.Module):
             lambda_var=self.lambda_var,
             lambda_inv=self.lambda_inv,
             lambda_cov=self.lambda_cov,
-            gamma=self.gamma)
+            gamma=self.gamma,
+            inv_mode=self.inv_mode,
+            inv_temp=self.inv_temp)
 
         total.backward()
         self.optimizer.step()

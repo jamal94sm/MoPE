@@ -388,34 +388,33 @@ class ContrastiveTent(nn.Module):
         return outputs, info
 
     @torch.enable_grad()
-    def _adapt(self, x):
-        # Original forward
-        logits = self.model(x)
-
-        # Get embeddings for contrastive
+    def _get_embeddings(self, x):
         if hasattr(self.model, 'get_embeddings'):
-            z_orig = self.model.get_embeddings(x)
+            return self.model.get_embeddings(x)
         elif hasattr(self.model, 'backbone'):
-            z_orig = self.model.backbone(x)
+            return self.model.backbone(x)
         else:
-            z_orig = self.model(x)
+            return self.model(x)
 
-        # Augmented forward
+    def _adapt(self, x):
+        # Get embeddings (single forward pass through backbone)
+        z_orig = self._get_embeddings(x)
+
+        # Augmented embeddings
         x_aug = augment_batch(x, self.aug_transform,
                               use_fft=self.use_fft, fft_beta=self.fft_beta)
-        if hasattr(self.model, 'get_embeddings'):
-            z_aug = self.model.get_embeddings(x_aug)
-        elif hasattr(self.model, 'backbone'):
-            z_aug = self.model.backbone(x_aug)
-        else:
-            z_aug = self.model(x_aug)
+        z_aug = self._get_embeddings(x_aug)
 
         # Losses
         info = {}
-
         total_loss = torch.tensor(0.0, device=x.device)
 
         if self.use_entropy:
+            # Get logits from embeddings (head only, no extra backbone pass)
+            if hasattr(self.model, 'head'):
+                logits = self.model.head(z_orig, labels=None)
+            else:
+                logits = self.model(x)
             ent_loss = softmax_entropy(logits).mean(0)
             total_loss = total_loss + ent_loss
             info["entropy"] = ent_loss.item()
@@ -473,11 +472,7 @@ def feature_im_loss(z, temperature=0.1):
     p_marginal = p.mean(dim=0)
     H_marg = -(p_marginal * (p_marginal + 1e-8).log()).sum()
 
-    # Clamp: if clusters are already good, produce no gradient
-    loss = F.relu(H_cond - H_marg)
-    #loss = H_cond - H_marg
-
-    return loss
+    return H_cond - H_marg
 
 
 class ContrastiveFIM(nn.Module):

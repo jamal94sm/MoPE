@@ -284,7 +284,7 @@ def adapt_casia_ms(cfg):
     # ══════════════════════════════════════════════════════════
     model.backbone.requires_grad_(False)
 
-    if cfg.tta_method in ("tent", "contrastive_em", "contrastive_fim"):
+    if cfg.tta_method in ("tent", "contrastive_em"):
         print(f"\n{'─'*70}")
         print(f"  PHASE 2: Train test-ID head ({n_test_cls} classes)")
         print(f"  Source domain: {cfg.train_spectrums}")

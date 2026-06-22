@@ -403,7 +403,7 @@ def adapt_casia_ms(cfg):
                 hdr = f"  │ {'bat':>5} │{'spec':>6} │{'H':>6}"
 
             elif cfg.tta_method == "contrastive_em":
-                aug_tf = tent.get_tta_augmentation(cfg.img_size)
+                aug_tf = tent.get_tta_augmentation_strong(cfg.img_size)
                 tta_obj = tent.ContrastiveTent(
                     model, opt, aug_tf,
                     contrastive_lambda=cfg.contrastive_lambda,
@@ -414,7 +414,7 @@ def adapt_casia_ms(cfg):
                        f"{'con':>6} │{'total':>6}")
 
             elif cfg.tta_method == "contrastive":
-                aug_tf = tent.get_tta_augmentation(cfg.img_size)
+                aug_tf = tent.get_tta_augmentation_strong(cfg.img_size)
                 tta_obj = tent.ContrastiveTent(
                     model, opt, aug_tf,
                     contrastive_lambda=cfg.contrastive_lambda,

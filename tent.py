@@ -337,3 +337,112 @@ class JEPATTA(nn.Module):
         self.predictor.load_state_dict(
             {k: v.clone() for k, v in self.predictor_state.items()})
         self.optimizer.load_state_dict(self.optimizer_state)
+
+
+class JEPAContrastive(nn.Module):
+    """
+    Combined NT-Xent + JEPA at TTA time.
+
+    L = λ_con × NT-Xent(z, z_aug) + λ_jepa × smooth_l1(pred(z), z_teacher)
+
+    NT-Xent: immediate domain adaptation via contrastive signal
+    JEPA: stability via prediction consistency with EMA teacher
+    """
+    def __init__(self, model, optimizer, aug_transform, predictor,
+                 con_lambda=1.0, con_temp=0.5,
+                 jepa_lambda=1.0, momentum=0.996,
+                 loss_fn="smooth_l1",
+                 use_fft=True, fft_beta=0.02, steps=1):
+        super().__init__()
+        self.student = model
+        self.optimizer = optimizer
+        self.aug_transform = aug_transform
+        self.predictor = predictor
+        self.con_lambda = con_lambda
+        self.con_temp = con_temp
+        self.jepa_lambda = jepa_lambda
+        self.momentum = momentum
+        self.use_fft = use_fft
+        self.fft_beta = fft_beta
+        self.steps = steps
+
+        self.jepa_loss_fn = (F.smooth_l1_loss if loss_fn == "smooth_l1"
+                             else F.mse_loss)
+
+        self.teacher = deepcopy(model)
+        self.teacher.requires_grad_(False)
+        self.teacher.eval()
+
+        self.student_state = deepcopy(self.student.state_dict())
+        self.teacher_state = deepcopy(self.teacher.state_dict())
+        self.predictor_state = deepcopy(self.predictor.state_dict())
+        self.optimizer_state = deepcopy(self.optimizer.state_dict())
+
+    def _get_raw(self, model, x):
+        if hasattr(model, 'get_raw_embeddings'):
+            return model.get_raw_embeddings(x)
+        elif hasattr(model, 'backbone') and \
+                hasattr(model.backbone, 'forward_raw'):
+            return model.backbone.forward_raw(x)
+        elif hasattr(model, 'get_embeddings'):
+            return model.get_embeddings(x)
+        else:
+            return model(x)
+
+    def forward(self, x):
+        for _ in range(self.steps):
+            outputs, info = self._adapt(x)
+        return outputs, info
+
+    @torch.enable_grad()
+    def _adapt(self, x):
+        # Student: original
+        z_s = self._get_raw(self.student, x)
+
+        # Augmented
+        x_aug = augment_batch(x, self.aug_transform,
+                              use_fft=self.use_fft, fft_beta=self.fft_beta)
+        z_aug = self._get_raw(self.student, x_aug)
+
+        # Teacher: augmented (detached)
+        with torch.no_grad():
+            z_t = self._get_raw(self.teacher, x_aug)
+
+        total = torch.tensor(0.0, device=x.device)
+        info = {}
+
+        # NT-Xent contrastive
+        con_loss = nt_xent_loss(F.normalize(z_s, dim=-1),
+                                F.normalize(z_aug, dim=-1),
+                                self.con_temp)
+        total = total + self.con_lambda * con_loss
+        info["con"] = con_loss.item()
+
+        # JEPA prediction
+        z_p = self.predictor(z_s)
+        jepa_loss = self.jepa_loss_fn(z_p, z_t)
+        total = total + self.jepa_lambda * jepa_loss
+        info["jepa"] = jepa_loss.item()
+
+        info["total"] = total.item()
+
+        with torch.no_grad():
+            info["sim"] = F.cosine_similarity(z_s, z_t, dim=-1).mean().item()
+
+        self.optimizer.zero_grad()
+        total.backward()
+        self.optimizer.step()
+
+        with torch.no_grad():
+            ema_update(self.student, self.teacher, self.momentum)
+
+        return z_s.detach(), info
+
+    def reset(self):
+        self.student.load_state_dict(
+            {k: v.clone() for k, v in self.student_state.items()})
+        self.teacher.load_state_dict(
+            {k: v.clone() for k, v in self.teacher_state.items()})
+        self.predictor.load_state_dict(
+            {k: v.clone() for k, v in self.predictor_state.items()})
+        self.optimizer.load_state_dict(self.optimizer_state)

@@ -428,7 +428,7 @@ class ContrastiveTent(nn.Module):
         self.optimizer.step()
         self.optimizer.zero_grad()
 
-        return logits.detach(), info
+        return z_orig.detach(), info
 
     def reset(self):
         if self.model_state is None or self.optimizer_state is None:

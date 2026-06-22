@@ -472,7 +472,7 @@ def feature_im_loss(z, temperature=0.1):
     p_marginal = p.mean(dim=0)
     H_marg = -(p_marginal * (p_marginal + 1e-8).log()).sum()
 
-    return H_cond - H_marg
+    return F.relu(H_cond - H_marg)
 
 
 class ContrastiveFIM(nn.Module):

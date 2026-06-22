@@ -6,5 +6,16 @@ mope_convnext_mkmmd.py: L2-norm consitency loss is added. GRL is replaced by MK-
 
 mope_cnn.py: replace ConvNeXt model with a small custom CNN model.
 
+
+
+best setting for continual mode on CASIA-MS: 
 python main.py --dataset casia_ms --data_dir /home/pai-ng/Jamal/CASIA-MS-ROI \
-    --eval_backbone --gallery_ratio 0.1
+    --tta_method contrastive_nn --nn_lambda 1.0 --nn_temp 0.1
+
+Best setting for episodic mode on CASIA-MS: 
+python main.py --dataset casia_ms --data_dir /home/pai-ng/Jamal/CASIA-MS-ROI \
+    --tta_method contrastive
+
+the improvement comes primarily from BN running stats adaptation (safe_bn mode) + Contrastive loss(NT-Xent) + Nearest Neighbers Cosistency loss term (for continual). 
+
+

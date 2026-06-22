@@ -144,7 +144,7 @@ def get_cfg(args=None):
                    help="VICReg: weight of variance term")
     p.add_argument("--vicreg_inv", type=float, default=0.1,
                    help="VICReg: weight of invariance term")
-    p.add_argument("--vicreg_cov", type=float, default=0.04,
+    p.add_argument("--vicreg_cov", type=float, default=0.1,
                    help="VICReg: weight of covariance term")
     p.add_argument("--vicreg_gamma", type=float, default=1.0,
                    help="VICReg: target std threshold for variance hinge")

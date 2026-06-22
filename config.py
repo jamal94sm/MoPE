@@ -135,10 +135,10 @@ def get_cfg(args=None):
                    help="Weight of feature IM loss (contrastive_fim mode)")
     p.add_argument("--fim_temp", type=float, default=0.1,
                    help="Temperature for feature IM neighborhood softmax")
-    p.add_argument("--use_fft_aug", action="store_true", default=False,
+    p.add_argument("--use_fft_aug", action="store_true", default=True,
                    help="Use FFT amplitude swap augmentation")
     p.add_argument("--no_fft_aug", dest="use_fft_aug", action="store_false")
-    p.add_argument("--fft_beta", type=float, default=0.2,
+    p.add_argument("--fft_beta", type=float, default=0.02,
                    help="Fraction of low-frequency band to swap in FFT aug")
     p.add_argument("--vicreg_var", type=float, default=1.0,
                    help="VICReg: weight of variance term")

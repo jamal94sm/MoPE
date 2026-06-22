@@ -443,7 +443,7 @@ def adapt_casia_ms(cfg):
                        f"{'fim':>6} │{'total':>6}")
 
             elif cfg.tta_method == "vicreg":
-                aug_tf = tent.get_tta_augmentation(cfg.img_size)
+                aug_tf = tent.get_tta_augmentation_strong(cfg.img_size)
                 tta_obj = tent.VICRegTTA(
                     model, opt, aug_tf,
                     lambda_var=cfg.vicreg_var,

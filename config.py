@@ -47,7 +47,7 @@ def get_cfg(args=None):
     p.add_argument("--oracle_domains", action="store_true", default=False)
 
     # ─── ArcFace training ─────────────────────────────────────
-    p.add_argument("--arcface_epochs", type=int, default=50)
+    p.add_argument("--arcface_epochs", type=int, default=20)
     p.add_argument("--arcface_head_epochs", type=int, default=10)
     p.add_argument("--arcface_lr", type=float, default=1e-4)
     p.add_argument("--arcface_lr_phase2", type=float, default=1e-2)
@@ -61,7 +61,7 @@ def get_cfg(args=None):
     # ─── Backbone ─────────────────────────────────────────────
     p.add_argument("--backbone", default="vit_base",
                    choices=["vit_base", "resnet50", "resnet101",
-                            "arcface_r100"])
+                            "arcface_r100", "dinov2_vits14"])
     p.add_argument("--arcface_onnx", type=str,
                    default="/home/pai-ng/Jamal/NIPS2026/face_models/"
                            "checkpoints/r100_glint360k.onnx")
@@ -70,13 +70,23 @@ def get_cfg(args=None):
     p.add_argument("--num_classes", type=int, default=1000)
     p.add_argument("--img_size", type=int, default=224)
 
+    # ─── DINOv2 params ────────────────────────────────────────
+    p.add_argument("--dino_train_blocks", type=int, default=2,
+                   help="Number of unfrozen DINOv2 blocks during Phase 1")
+    p.add_argument("--dino_tta_blocks", type=int, default=0,
+                   help="Number of unfrozen DINOv2 blocks during TTA "
+                        "(all LayerNorm always unfrozen)")
+
     # ─── TTA method ───────────────────────────────────────────
     p.add_argument("--tta_method", default="contrastive",
-                   choices=["contrastive", "jepa", "jepa_joint", "jepa_con"],
+                   choices=["contrastive", "jepa", "jepa_joint",
+                            "jepa_con", "jepa_orig"],
                    help="'contrastive' = NT-Xent, "
-                        "'jepa' = 3-phase (ArcFace → warmup → TTA), "
-                        "'jepa_joint' = joint ArcFace+JEPA Phase 1 → TTA, "
-                        "'jepa_con' = NT-Xent + JEPA at TTA time")
+                        "'jepa' = 3-phase warmup → TTA, "
+                        "'jepa_joint' = joint ArcFace+JEPA → TTA, "
+                        "'jepa_con' = NT-Xent + JEPA at TTA, "
+                        "'jepa_orig' = original JEPA with patch masking "
+                        "(requires DINOv2 backbone)")
     p.add_argument("--tent_lr", type=float, default=1e-4)
     p.add_argument("--tent_steps", type=int, default=1)
     p.add_argument("--reset_tta", action="store_true", default=False,
@@ -95,15 +105,27 @@ def get_cfg(args=None):
                    help="EMA momentum for teacher (0.99-0.999)")
     p.add_argument("--jepa_pred_dim", type=int, default=256,
                    help="Predictor MLP hidden dimension")
-    p.add_argument("--jepa_loss", default="smooth_l1",
+    p.add_argument("--jepa_loss", default="cosine",
                    choices=["smooth_l1", "mse", "cosine"])
-    p.add_argument("--jepa_warmup_epochs", type=int, default=50,
+    p.add_argument("--jepa_warmup_epochs", type=int, default=0,
                    help="Epochs to warm up predictor on source (Phase 1.5)")
     p.add_argument("--jepa_train_lambda", type=float, default=1.0,
                    help="Weight of JEPA loss during Phase 1 joint training")
     p.add_argument("--jepa_con_lambda", type=float, default=1.0,
                    help="Weight of contrastive loss in jepa_con mode "
                         "(JEPA weight uses jepa_train_lambda)")
+
+    # ─── JEPA-orig masking params ─────────────────────────────
+    p.add_argument("--jepa_num_blocks", type=int, default=2,
+                   help="Number of target mask blocks")
+    p.add_argument("--jepa_trg_ratio", type=float, nargs=2,
+                   default=[0.10, 0.15], help="Target block scale range")
+    p.add_argument("--jepa_ctx_ratio", type=float, nargs=2,
+                   default=[0.90, 1.00], help="Context block scale range")
+    p.add_argument("--jepa_pred_depth", type=int, default=4,
+                   help="Predictor transformer depth")
+    p.add_argument("--jepa_pretrain_epochs", type=int, default=50,
+                   help="Epochs for JEPA pretraining on source (Phase 1)")
 
     # ─── Augmentation ─────────────────────────────────────────
     p.add_argument("--use_fft_aug", action="store_true", default=True)
@@ -120,11 +142,17 @@ def get_cfg(args=None):
 
     if cfg.dataset == "casia_ms":
         cfg.is_verification = True
-        if cfg.backbone != "arcface_r100":
+        if cfg.tta_method == "jepa_orig":
+            if cfg.backbone != "dinov2_vits14":
+                print(f"[WARN] jepa_orig requires dinov2_vits14, "
+                      f"overriding '{cfg.backbone}'")
+                cfg.backbone = "dinov2_vits14"
+            cfg.img_size = 112
+        elif cfg.backbone != "arcface_r100":
             print(f"[WARN] CASIA-MS requires arcface_r100, "
                   f"overriding '{cfg.backbone}'")
             cfg.backbone = "arcface_r100"
-        cfg.img_size = 112
+            cfg.img_size = 112
     else:
         cfg.is_verification = False
 

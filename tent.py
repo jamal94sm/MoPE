@@ -456,3 +456,305 @@ class JEPAContrastive(nn.Module):
         self.predictor.load_state_dict(
             {k: v.clone() for k, v in self.predictor_state.items()})
         self.optimizer.load_state_dict(self.optimizer_state)
+
+
+# ══════════════════════════════════════════════════════════════
+#  JEPA-Original: Patch masking + Transformer predictor
+#  Adapted from I-JEPA (Assran et al., 2023)
+# ══════════════════════════════════════════════════════════════
+
+def patchify(batch_size, num_patches, num_blocks=4,
+             trg_ratio=(0.15, 0.20), ctx_ratio=(0.85, 1.00),
+             ar_range=(0.75, 1.5), device="cpu"):
+    """
+    Create context and target masks for JEPA.
+    Returns: [ctx_mask], [tgt_mask1, ..., tgt_maskK]
+      ctx_mask: (B, N_ctx) integer indices of visible patches
+      tgt_masks: each (B, N_tgt) integer indices of target patches
+    """
+    import math
+    H = W = int(num_patches ** 0.5)
+    P = H * W
+
+    def sample_block(scale):
+        s = torch.empty(()).uniform_(*scale).item()
+        ar = torch.empty(()).uniform_(*ar_range).item()
+        area = max(1, int(s * P))
+        h = max(1, min(H, int(round(math.sqrt(area * ar)))))
+        w = max(1, min(W, int(round(area / h))))
+        y = torch.randint(0, max(1, H - h + 1), ())
+        x = torch.randint(0, max(1, W - w + 1), ())
+        idx = [(y+i)*W + (x+j) for i in range(h) for j in range(w)]
+        return torch.tensor(idx, device=device)
+
+    ctx_masks = []
+    tgt_masks = [[] for _ in range(num_blocks)]
+    min_ctx = P
+    min_tgt = P
+
+    for _ in range(batch_size):
+        occupied = torch.zeros(P, dtype=torch.bool, device=device)
+        for k in range(num_blocks):
+            idx = sample_block(trg_ratio)
+            tgt_masks[k].append(idx)
+            occupied[idx] = True
+            min_tgt = min(min_tgt, idx.numel())
+        for _ in range(10):
+            ctx = sample_block(ctx_ratio)
+            ctx = ctx[~occupied[ctx]]
+            if ctx.numel() > 0:
+                break
+        else:
+            ctx = (~occupied).nonzero().squeeze(1)
+        min_ctx = min(min_ctx, ctx.numel())
+        ctx_masks.append(ctx)
+
+    ctx_out = torch.stack([
+        c[torch.randperm(c.numel(), device=device)[:min_ctx]]
+        for c in ctx_masks
+    ])
+    tgt_out = [
+        torch.stack([
+            t[torch.randperm(t.numel(), device=device)[:min_tgt]]
+            for t in tgt_masks[k]
+        ])
+        for k in range(num_blocks)
+    ]
+    return [ctx_out], tgt_out
+
+
+def get_2d_sincos_pos_embed(embed_dim, grid_size):
+    """2D sinusoidal positional embeddings."""
+    import numpy as np
+    def _1d(dim, pos):
+        omega = np.arange(dim // 2, dtype=float) / (dim / 2.)
+        omega = 1. / (10000 ** omega)
+        out = np.einsum('m,d->md', pos.reshape(-1), omega)
+        return np.concatenate([np.sin(out), np.cos(out)], axis=1)
+    gh = np.arange(grid_size, dtype=float)
+    grid = np.meshgrid(gh, gh)
+    emb_h = _1d(embed_dim // 2, grid[0].flatten())
+    emb_w = _1d(embed_dim // 2, grid[1].flatten())
+    return np.concatenate([emb_h, emb_w], axis=1)
+
+
+def _gather(x, mask):
+    """Gather patches by index. x:(B,P,D), mask:(B,N) → (B,N,D)"""
+    B, N = mask.shape
+    D = x.size(-1)
+    return torch.gather(x, 1, mask.unsqueeze(-1).expand(B, N, D))
+
+
+class JEPAPredictor(nn.Module):
+    """
+    Transformer predictor for JEPA.
+    Takes context patch embeddings + mask tokens → predicts target patches.
+    """
+    def __init__(self, num_patches, embed_dim, pred_dim=None, depth=6):
+        super().__init__()
+        if pred_dim is None:
+            pred_dim = embed_dim // 2
+        num_heads = max(1, pred_dim // 64)
+        while pred_dim % num_heads != 0:
+            num_heads -= 1
+
+        self.in_proj = nn.Linear(embed_dim, pred_dim)
+        self.out_proj = nn.Linear(pred_dim, embed_dim)
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, pred_dim))
+
+        pos = get_2d_sincos_pos_embed(pred_dim,
+                                       int(num_patches ** 0.5))
+        self.pos_embed = nn.Parameter(
+            torch.tensor(pos).float().unsqueeze(0), requires_grad=False)
+
+        enc = nn.TransformerEncoderLayer(
+            d_model=pred_dim, nhead=num_heads,
+            dim_feedforward=int(pred_dim * 4),
+            batch_first=True, norm_first=True)
+        self.encoder = nn.TransformerEncoder(enc, depth)
+        self.norm = nn.LayerNorm(pred_dim)
+
+    def forward(self, context, context_masks, target_masks):
+        """
+        context:       (B*n_ctx, N_ctx, D)
+        context_masks: list[(B, N_ctx)]
+        target_masks:  list[(B, N_tgt)]
+        Returns:       (B*n_ctx*n_tgt, N_tgt, D)
+        """
+        if not isinstance(context_masks, list):
+            context_masks = [context_masks]
+        if not isinstance(target_masks, list):
+            target_masks = [target_masks]
+
+        n_ctx = len(context_masks)
+        n_tgt = len(target_masks)
+        B = context.size(0) // n_ctx
+        N_tgt = target_masks[0].size(1)
+
+        x = self.in_proj(context)
+
+        pos_full = self.pos_embed.expand(B, -1, -1)
+        pos_ctx = torch.cat(
+            [_gather(pos_full, m) for m in context_masks], dim=0)
+        x = x + pos_ctx
+
+        pos_tgt = torch.cat(
+            [_gather(pos_full, m) for m in target_masks], dim=0)
+        mask_tokens = self.mask_token.expand(
+            pos_tgt.size(0), N_tgt, -1) + pos_tgt
+
+        x = x.repeat(n_tgt, 1, 1)
+        x = torch.cat([x, mask_tokens], dim=1)
+        x = self.encoder(x)
+        x = self.norm(x)
+
+        preds = x[:, -N_tgt:]
+        return self.out_proj(preds)
+
+
+def _repeat_interleave_batch(x, B, repeat):
+    """Tile x so each group of B rows is repeated."""
+    N, D = x.size(1), x.size(2)
+    num_blocks = x.size(0) // B
+    x = x.view(B, num_blocks, N, D)
+    x = x.unsqueeze(1).expand(-1, repeat, -1, -1, -1)
+    return x.reshape(B * repeat * num_blocks, N, D)
+
+
+def apply_masks(x, masks):
+    """Gather patches for each mask. x:(B,P,D), masks:list[(B,N)]"""
+    out = []
+    for m in masks:
+        out.append(_gather(x, m))
+    return torch.cat(out, dim=0)
+
+
+def collect_ln_params(model):
+    """Collect all LayerNorm parameters (for DINOv2 TTA)."""
+    params, names = [], []
+    for nm, m in model.named_modules():
+        if isinstance(m, nn.LayerNorm):
+            for pn, p in m.named_parameters():
+                if p.requires_grad:
+                    params.append(p)
+                    names.append(f"{nm}.{pn}")
+    return params, names
+
+
+class JEPAOriginal(nn.Module):
+    """
+    Original JEPA with patch masking + Transformer predictor.
+
+    Context encoder sees ~85% patches → embeddings
+    Target encoder (EMA) sees 100% patches → target embeddings
+    Predictor: context embeddings + mask tokens → predict target patches
+
+    Loss = smooth_l1(predicted_patches, target_patches)
+
+    For TTA: only LayerNorm params updated in context encoder.
+    Predictor stays frozen (already learned from source).
+    """
+    def __init__(self, context_encoder, target_encoder, predictor,
+                 optimizer, num_patches, num_blocks=4,
+                 trg_ratio=(0.15, 0.20), ctx_ratio=(0.85, 1.00),
+                 momentum=0.996, loss_fn="smooth_l1",
+                 update_predictor=True, steps=1):
+        super().__init__()
+        self.context_encoder = context_encoder
+        self.target_encoder = target_encoder
+        self.predictor = predictor
+        self.optimizer = optimizer
+        self.num_patches = num_patches
+        self.num_blocks = num_blocks
+        self.trg_ratio = tuple(trg_ratio)
+        self.ctx_ratio = tuple(ctx_ratio)
+        self.momentum = momentum
+        self.update_predictor = update_predictor
+        self.steps = steps
+
+        if loss_fn == "cosine":
+            self.loss_fn = lambda p, t: (
+                1 - F.cosine_similarity(
+                    p.reshape(-1, p.size(-1)),
+                    t.reshape(-1, t.size(-1)), dim=-1)).mean()
+        elif loss_fn == "smooth_l1":
+            self.loss_fn = F.smooth_l1_loss
+        else:
+            self.loss_fn = F.mse_loss
+
+        self.ctx_state = deepcopy(context_encoder.state_dict())
+        self.tgt_state = deepcopy(target_encoder.state_dict())
+        self.pred_state = deepcopy(predictor.state_dict())
+        self.opt_state = deepcopy(optimizer.state_dict())
+
+    def forward(self, x):
+        for _ in range(self.steps):
+            outputs, info = self._adapt(x)
+        return outputs, info
+
+    @torch.enable_grad()
+    def _adapt(self, x):
+        B = x.shape[0]
+        device = x.device
+
+        ctx_masks, tgt_masks = patchify(
+            B, self.num_patches, self.num_blocks,
+            trg_ratio=self.trg_ratio, ctx_ratio=self.ctx_ratio,
+            device=device)
+
+        # Context encoder: masked patches
+        ctx_embeds = self.context_encoder.forward_patches(
+            x, ctx_masks[0])[:, 1:, :]  # remove CLS
+
+        # Target encoder: all patches (no grad)
+        with torch.no_grad():
+            tgt_full = self.target_encoder.forward_patches(x)
+            tgt_full = tgt_full[:, 1:, :]  # remove CLS
+            tgt_embeds = apply_masks(tgt_full, tgt_masks)
+            tgt_embeds = _repeat_interleave_batch(
+                tgt_embeds, B, repeat=len(ctx_masks))
+
+        # Predictor
+        if self.update_predictor:
+            pred_embeds = self.predictor(ctx_embeds, ctx_masks, tgt_masks)
+        else:
+            with torch.no_grad():
+                pred_embeds = self.predictor(
+                    ctx_embeds, ctx_masks, tgt_masks)
+            # Re-enable grad for encoder params by recomputing
+            pred_embeds = self.predictor(ctx_embeds, ctx_masks, tgt_masks)
+
+        loss = self.loss_fn(pred_embeds, tgt_embeds)
+
+        with torch.no_grad():
+            sim = F.cosine_similarity(
+                pred_embeds.reshape(-1, pred_embeds.size(-1)),
+                tgt_embeds.reshape(-1, tgt_embeds.size(-1)),
+                dim=-1).mean().item()
+            p_std = pred_embeds.std(dim=-2).mean().item()
+
+        info = {
+            "loss": loss.item(),
+            "sim": sim,
+            "p_std": p_std,
+            "total": loss.item(),
+        }
+
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+        with torch.no_grad():
+            ema_update(self.context_encoder, self.target_encoder,
+                       self.momentum)
+
+        return ctx_embeds[:B, 0, :].detach(), info
+
+    def reset(self):
+        self.context_encoder.load_state_dict(
+            {k: v.clone() for k, v in self.ctx_state.items()})
+        self.target_encoder.load_state_dict(
+            {k: v.clone() for k, v in self.tgt_state.items()})
+        self.predictor.load_state_dict(
+            {k: v.clone() for k, v in self.pred_state.items()})
+        self.optimizer.load_state_dict(self.opt_state)

@@ -47,7 +47,7 @@ def get_cfg(args=None):
     p.add_argument("--oracle_domains", action="store_true", default=False)
 
     # ─── ArcFace training ─────────────────────────────────────
-    p.add_argument("--arcface_epochs", type=int, default=20)
+    p.add_argument("--arcface_epochs", type=int, default=50)
     p.add_argument("--arcface_head_epochs", type=int, default=10)
     p.add_argument("--arcface_lr", type=float, default=1e-4)
     p.add_argument("--arcface_lr_phase2", type=float, default=1e-2)
@@ -97,7 +97,7 @@ def get_cfg(args=None):
                    help="Predictor MLP hidden dimension")
     p.add_argument("--jepa_loss", default="smooth_l1",
                    choices=["smooth_l1", "mse", "cosine"])
-    p.add_argument("--jepa_warmup_epochs", type=int, default=0,
+    p.add_argument("--jepa_warmup_epochs", type=int, default=50,
                    help="Epochs to warm up predictor on source (Phase 1.5)")
     p.add_argument("--jepa_train_lambda", type=float, default=1.0,
                    help="Weight of JEPA loss during Phase 1 joint training")

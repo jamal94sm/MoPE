@@ -601,11 +601,253 @@ def adapt_casia_ms(cfg):
 
 
 # ══════════════════════════════════════════════════════════════
+
+
+def adapt_casia_ms_dino(cfg):
+    """DINOv2 pipeline: JEPA-orig pretraining + TTA, or contrastive TTA."""
+    from backbones import DINOv2Model
+    from copy import deepcopy
+
+    method_label = cfg.tta_method.upper()
+    print(f"\n{'='*80}")
+    print(f"  TTA — CASIA-MS | DINOv2 ViT-S/14 | Method: {method_label}")
+    print(f"  Mode: {'episodic' if cfg.reset_tta else 'continual'}")
+    print(f"{'='*80}\n")
+
+    os.makedirs(cfg.output_dir, exist_ok=True)
+
+    (train_ids, test_ids, train_id_map, test_id_map,
+     backbone_train_loader, test_head_train_loader,
+     test_loaders) = get_casia_ms_train_test(
+        cfg.data_dir, cfg.train_spectrums, cfg.batch_size,
+        cfg.num_workers, cfg.img_size, cfg.test_id_ratio, cfg.seed)
+
+    n_train_cls = len(train_id_map)
+    n_test_cls = len(test_id_map)
+
+    print(f"  Loading DINOv2 ViT-S/14...")
+    model = DINOv2Model("dinov2_vits14", cfg.img_size).to(cfg.device)
+    num_patches = model.backbone.num_patches
+    embed_dim = model.backbone.embed_dim
+    print(f"  embed_dim={embed_dim}, patches={num_patches}, "
+          f"params={sum(p.numel() for p in model.parameters())/1e6:.1f}M")
+
+    predictor = None
+    warm_predictor_state = None
+
+    if cfg.tta_method == "jepa_orig":
+        print(f"\n{'─'*70}")
+        print(f"  PHASE 1: JEPA pretraining on source (no labels)")
+        print(f"  {cfg.jepa_pretrain_epochs} epochs, "
+              f"last {cfg.dino_train_blocks} blocks unfrozen")
+        print(f"{'─'*70}")
+
+        model.backbone.freeze_except_last_n(cfg.dino_train_blocks)
+        n_tr = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"  Trainable backbone: {n_tr/1e6:.2f}M")
+
+        target_model = deepcopy(model).to(cfg.device)
+        target_model.requires_grad_(False)
+        target_model.eval()
+
+        predictor = tent.JEPAPredictor(
+            num_patches, embed_dim, pred_dim=embed_dim // 2,
+            depth=cfg.jepa_pred_depth).to(cfg.device)
+        print(f"  Predictor: {sum(p.numel() for p in predictor.parameters())/1e6:.2f}M")
+
+        jepa_loss_fn = F.smooth_l1_loss
+
+        train_params = ([p for p in model.parameters() if p.requires_grad]
+                        + list(predictor.parameters()))
+        opt = torch.optim.AdamW(train_params, lr=cfg.arcface_lr,
+                                 weight_decay=cfg.arcface_wd)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            opt, T_max=cfg.jepa_pretrain_epochs, eta_min=1e-6)
+
+        for epoch in range(1, cfg.jepa_pretrain_epochs + 1):
+            model.train(); predictor.train()
+            ep_loss = 0.0; n_bat = 0
+            for imgs, _ in backbone_train_loader:
+                imgs = imgs.to(cfg.device)
+                B = imgs.shape[0]
+                ctx_masks, tgt_masks = tent.patchify(
+                    B, num_patches, cfg.jepa_num_blocks,
+                    trg_ratio=tuple(cfg.jepa_trg_ratio),
+                    ctx_ratio=tuple(cfg.jepa_ctx_ratio),
+                    device=cfg.device)
+                ctx_embeds = model.forward_patches(
+                    imgs, ctx_masks[0])[:, 1:, :]
+                with torch.no_grad():
+                    tgt_full = target_model.forward_patches(imgs)[:, 1:, :]
+                    tgt_embeds = tent.apply_masks(tgt_full, tgt_masks)
+                    tgt_embeds = tent._repeat_interleave_batch(
+                        tgt_embeds, B, repeat=len(ctx_masks))
+                pred_embeds = predictor(ctx_embeds, ctx_masks, tgt_masks)
+                loss = jepa_loss_fn(pred_embeds, tgt_embeds)
+                opt.zero_grad(); loss.backward()
+                torch.nn.utils.clip_grad_norm_(train_params, 5.0)
+                opt.step()
+                with torch.no_grad():
+                    tent.ema_update(model, target_model, cfg.jepa_momentum)
+                ep_loss += loss.item(); n_bat += 1
+            scheduler.step()
+            with torch.no_grad():
+                sim = F.cosine_similarity(
+                    pred_embeds.reshape(-1, embed_dim),
+                    tgt_embeds.reshape(-1, embed_dim), dim=-1).mean().item()
+            ts = time.strftime("%H:%M:%S")
+            if epoch % 5 == 0 or epoch == cfg.jepa_pretrain_epochs:
+                print(f"  [{ts}] ep {epoch:03d}/{cfg.jepa_pretrain_epochs}  "
+                      f"loss={ep_loss/n_bat:.4f}  sim={sim:.3f}")
+
+        warm_predictor_state = deepcopy(predictor.state_dict())
+        print(f"  Done. sim={sim:.3f}")
+    else:
+        print(f"  No Phase 1 (using pretrained DINOv2 directly)")
+
+    model.eval()
+    print(f"\n{'─'*70}")
+    print(f"  PHASE 3: Pre-TTA Baseline")
+    print(f"{'─'*70}")
+    baseline = eval_test_spectrums(model, test_loaders, cfg, tag="[pre-TTA] ")
+
+    print(f"\n{'─'*70}")
+    print(f"  PHASE 4+5: {method_label} "
+          f"({'episodic' if cfg.reset_tta else 'continual'})")
+    print(f"{'─'*70}")
+
+    dom_seq = [(s, i, [(s, ld, ds)])
+               for i, (s, ld, ds) in enumerate(test_loaders)]
+    pre_adapt_state = deepcopy(model.state_dict())
+    post_tta = {}
+
+    def _setup_tta():
+        model.backbone.configure_for_tta(cfg.dino_tta_blocks)
+        tta_params = tent.collect_ln_params(model)[0]
+        aug_tf = tent.get_tta_augmentation(cfg.img_size)
+        if cfg.tta_method == "contrastive":
+            opt = torch.optim.Adam(tta_params, lr=cfg.tent_lr)
+            return tent.Contrastive(
+                model, opt, aug_tf,
+                contrastive_lambda=cfg.contrastive_lambda,
+                contrastive_temp=cfg.contrastive_temp,
+                use_fft=cfg.use_fft_aug, fft_beta=cfg.fft_beta,
+                steps=cfg.tent_steps)
+        elif cfg.tta_method == "jepa_orig":
+            pred = tent.JEPAPredictor(
+                num_patches, embed_dim, pred_dim=embed_dim // 2,
+                depth=cfg.jepa_pred_depth).to(cfg.device)
+            if warm_predictor_state is not None:
+                pred.load_state_dict(warm_predictor_state)
+            tgt = deepcopy(model).to(cfg.device)
+            tgt.requires_grad_(False); tgt.eval()
+            opt = torch.optim.Adam(tta_params, lr=cfg.tent_lr)
+            return tent.JEPAOriginal(
+                model, tgt, pred, opt,
+                num_patches=num_patches,
+                num_blocks=cfg.jepa_num_blocks,
+                trg_ratio=tuple(cfg.jepa_trg_ratio),
+                ctx_ratio=tuple(cfg.jepa_ctx_ratio),
+                momentum=cfg.jepa_momentum,
+                loss_fn=cfg.jepa_loss,
+                update_predictor=False,
+                steps=cfg.tent_steps)
+
+    if not cfg.reset_tta:
+        tta_obj = _setup_tta()
+        n_p = len(tent.collect_ln_params(model)[0])
+        print(f"  [{method_label}] {n_p} LN params")
+
+    for di, (dn, _, slist) in enumerate(dom_seq):
+        if cfg.reset_tta:
+            model.load_state_dict(deepcopy(pre_adapt_state))
+            tta_obj = _setup_tta()
+
+        print(f"\n  ┌── [{di+1}/{len(dom_seq)}] {dn}")
+        t0 = time.time()
+        tb = sum(len(l) for _, l, _ in slist)
+
+        if cfg.tta_method == "contrastive":
+            print(f"  │ {'bat':>5} │{'spec':>6} │{'con':>6} │{'total':>6}")
+        else:
+            print(f"  │ {'bat':>5} │{'spec':>6} │{'loss':>6} │"
+                  f"{'sim':>6} │{'p_std':>6}")
+        gb = 0
+        for sn, ld, _ in slist:
+            for imgs, _ in ld:
+                _, info = tta_obj(imgs.to(cfg.device))
+                if gb < 5 or gb % 50 == 0 or gb == tb - 1:
+                    if cfg.tta_method == "contrastive":
+                        print(f"  │ {gb:5d} │{sn:>6s} │"
+                              f"{info['con']:6.3f} │{info['total']:6.3f}")
+                    else:
+                        print(f"  │ {gb:5d} │{sn:>6s} │"
+                              f"{info['loss']:6.3f} │{info['sim']:6.3f} │"
+                              f"{info.get('p_std',0):6.3f}")
+                gb += 1
+        print(f"  │ Adapt: {time.time()-t0:.1f}s")
+
+        model.eval()
+        for sn, ld, ds in slist:
+            gallery_idx, probe_idx = split_gallery_probe(
+                ds, cfg.gallery_ratio, cfg.seed)
+            all_idx = list(range(len(ds)))
+            feats, labels = extract_embeddings(
+                model, ds, all_idx, cfg.batch_size, cfg.device, cfg.num_workers)
+            ver = evaluate_verification(feats.to(cfg.device), labels,
+                                         gallery_idx, probe_idx)
+            post_tta[sn] = ver
+            b = baseline.get(sn, {})
+            de = b.get("eer", 0) - ver["eer"]
+            dr = ver["rank1"] - b.get("rank1", 0)
+            print(f"  │ {sn}: EER {b.get('eer',-1):.2f}→{ver['eer']:.2f}% "
+                  f"({'↓' if de > 0 else '↑'}{abs(de):.2f}) | "
+                  f"R1 {b.get('rank1',-1):.2f}→{ver['rank1']:.2f}% "
+                  f"({'↑' if dr > 0 else '↓'}{abs(dr):.2f})")
+
+        if cfg.reset_tta:
+            print(f"  └── Reset")
+        else:
+            print(f"  └── Continuing"); model.train()
+
+    mode_str = "episodic" if cfg.reset_tta else "continual"
+    print(f"\n{'='*80}")
+    print(f"  FINAL ({method_label}, {mode_str}, DINOv2)")
+    print(f"{'='*80}")
+    print(f"\n  {'Spec':<10} {'Pre EER':>9} {'Pre R1':>8} "
+          f"{'Post EER':>9} {'Post R1':>8} {'ΔEER':>8} {'ΔR1':>8}")
+    print(f"  {'─'*65}")
+    for sn in post_tta:
+        b = baseline.get(sn, {}); n = post_tta[sn]
+        de = b.get("eer", 0) - n["eer"]; dr = n["rank1"] - b.get("rank1", 0)
+        print(f"  {sn:<10} {b.get('eer',-1):>8.2f}% {b.get('rank1',-1):>7.2f}% "
+              f"{n['eer']:>8.2f}% {n['rank1']:>7.2f}% "
+              f"{'↓' if de > 0 else '↑'}{abs(de):>6.2f}% "
+              f"{'↑' if dr > 0 else '↓'}{abs(dr):>6.2f}%")
+    def _m(d, k):
+        return np.mean([r[k] for r in d.values()]) if d else -1
+    be = _m(baseline, 'eer'); br = _m(baseline, 'rank1')
+    te = _m(post_tta, 'eer'); tr = _m(post_tta, 'rank1')
+    de = be - te; dr = tr - br
+    print(f"  {'─'*65}")
+    print(f"  {'MEAN':<10} {be:>8.2f}% {br:>7.2f}% "
+          f"{te:>8.2f}% {tr:>7.2f}% "
+          f"{'↓' if de > 0 else '↑'}{abs(de):>6.2f}% "
+          f"{'↑' if dr > 0 else '↓'}{abs(dr):>6.2f}%")
+    p = os.path.join(cfg.output_dir, f"dino_{cfg.tta_method}_seed{cfg.seed}.json")
+    with open(p, "w") as f:
+        json.dump({"tta_method": cfg.tta_method,
+                    "baseline": {k: dict(v) for k, v in baseline.items()},
+                    "post_tta": {k: dict(v) for k, v in post_tta.items()}}, f, indent=2)
+    print(f"\n  Saved: {p}")
+
 if __name__ == "__main__":
     cfg = get_cfg()
     set_seed(cfg.seed)
     if cfg.dataset == "casia_ms":
-        adapt_casia_ms(cfg)
+        if cfg.backbone == "dinov2_vits14":
+            adapt_casia_ms_dino(cfg)
+        else:
+            adapt_casia_ms(cfg)
     else:
-        raise ValueError(f"Dataset '{cfg.dataset}' — use contrastive/jepa "
-                         f"with casia_ms")
+        raise ValueError(f"Dataset '{cfg.dataset}' not supported")

@@ -165,8 +165,13 @@ def adapt_casia_ms(cfg):
         jepa_teacher.requires_grad_(False)
         jepa_teacher.eval()
 
-        jepa_loss_fn = (F.smooth_l1_loss if cfg.jepa_loss == "smooth_l1"
-                        else F.mse_loss)
+        if cfg.jepa_loss == "smooth_l1":
+            jepa_loss_fn = F.smooth_l1_loss
+        elif cfg.jepa_loss == "cosine":
+            jepa_loss_fn = lambda z_p, z_t: (
+                1 - F.cosine_similarity(z_p, z_t, dim=-1)).mean()
+        else:
+            jepa_loss_fn = F.mse_loss
         jepa_aug = tent.get_tta_augmentation(cfg.img_size)
 
         train_params += list(jepa_predictor.parameters())
@@ -270,8 +275,13 @@ def adapt_casia_ms(cfg):
         warm_teacher.requires_grad_(False)
         warm_teacher.eval()
 
-        jepa_loss_fn = (F.smooth_l1_loss if cfg.jepa_loss == "smooth_l1"
-                        else F.mse_loss)
+        if cfg.jepa_loss == "smooth_l1":
+            jepa_loss_fn = F.smooth_l1_loss
+        elif cfg.jepa_loss == "cosine":
+            jepa_loss_fn = lambda z_p, z_t: (
+                1 - F.cosine_similarity(z_p, z_t, dim=-1)).mean()
+        else:
+            jepa_loss_fn = F.mse_loss
 
         # Heavy FFT augmentation to simulate spectral shift
         aug_tf = tent.get_tta_augmentation(cfg.img_size)

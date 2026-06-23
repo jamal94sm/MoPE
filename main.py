@@ -252,24 +252,35 @@ def adapt_casia_ms(cfg):
     if cfg.tta_method in ("jepa", "jepa_con") and cfg.jepa_warmup_epochs > 0:
         print(f"\n{'─'*70}")
         print(f"  PHASE 2: JEPA predictor warm-up on source")
-        print(f"  {cfg.jepa_warmup_epochs} epochs, backbone FROZEN")
+        print(f"  {cfg.jepa_warmup_epochs} epochs, BN active + heavy FFT aug")
         print(f"{'─'*70}")
 
         from copy import deepcopy
         emb_dim = 512
 
+        # Enable BN in train mode (simulates TTA conditions)
+        warmup_model = deepcopy(model)
+        warmup_model = (tent.configure_model_safe(warmup_model) if cfg.safe_bn
+                        else tent.configure_model(warmup_model))
+        bn_params_warmup, _ = tent.collect_params(warmup_model)
+
         warm_predictor = tent.PredictorMLP(
             emb_dim, cfg.jepa_pred_dim, emb_dim).to(cfg.device)
-        warm_teacher = deepcopy(model)
+        warm_teacher = deepcopy(warmup_model)
         warm_teacher.requires_grad_(False)
         warm_teacher.eval()
 
         jepa_loss_fn = (F.smooth_l1_loss if cfg.jepa_loss == "smooth_l1"
                         else F.mse_loss)
+
+        # Heavy FFT augmentation to simulate spectral shift
         aug_tf = tent.get_tta_augmentation(cfg.img_size)
 
-        warmup_opt = torch.optim.Adam(warm_predictor.parameters(),
-                                       lr=cfg.tent_lr * 10)
+        # Optimizer: predictor + BN params (BN changes → teacher diverges)
+        warmup_opt = torch.optim.Adam([
+            {"params": warm_predictor.parameters(), "lr": cfg.tent_lr * 10},
+            {"params": bn_params_warmup, "lr": cfg.tent_lr},
+        ])
 
         def _get_raw(mdl, x):
             if hasattr(mdl, 'get_raw_embeddings'):
@@ -279,16 +290,19 @@ def adapt_casia_ms(cfg):
                 return mdl.backbone.forward_raw(x)
             return mdl.get_embeddings(x)
 
-        model.eval()
         for ep in range(1, cfg.jepa_warmup_epochs + 1):
             ep_loss = 0.0; n_bat = 0
             for imgs, _ in backbone_train_loader:
                 imgs = imgs.to(cfg.device)
+
+                # Student: original (BN in train mode → stats change)
+                z_s = _get_raw(warmup_model, imgs)
+
+                # Teacher: heavy FFT aug (simulates spectral domain shift)
                 with torch.no_grad():
-                    z_s = _get_raw(model, imgs)
                     x_aug = tent.augment_batch(
                         imgs, aug_tf,
-                        use_fft=cfg.use_fft_aug, fft_beta=cfg.fft_beta)
+                        use_fft=True, fft_beta=0.5)
                     z_t = _get_raw(warm_teacher, x_aug)
 
                 z_p = warm_predictor(z_s)
@@ -298,8 +312,10 @@ def adapt_casia_ms(cfg):
                 loss.backward()
                 warmup_opt.step()
 
+                # EMA: teacher ← student (now meaningful since BN changes)
                 with torch.no_grad():
-                    tent.ema_update(model, warm_teacher, cfg.jepa_momentum)
+                    tent.ema_update(warmup_model, warm_teacher,
+                                    cfg.jepa_momentum)
 
                 ep_loss += loss.item()
                 n_bat += 1

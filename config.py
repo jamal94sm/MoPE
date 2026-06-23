@@ -95,7 +95,7 @@ def get_cfg(args=None):
                    help="EMA momentum for teacher (0.99-0.999)")
     p.add_argument("--jepa_pred_dim", type=int, default=256,
                    help="Predictor MLP hidden dimension")
-    p.add_argument("--jepa_loss", default="cosine",
+    p.add_argument("--jepa_loss", default="smooth_l1",
                    choices=["smooth_l1", "mse", "cosine"])
     p.add_argument("--jepa_warmup_epochs", type=int, default=0,
                    help="Epochs to warm up predictor on source (Phase 1.5)")

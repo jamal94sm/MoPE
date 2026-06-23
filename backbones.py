@@ -354,3 +354,120 @@ def build_model(cfg):
 
     else:
         raise ValueError(f"Unknown backbone: {cfg.backbone}")
+
+
+# ══════════════════════════════════════════════════════════════
+#  DINOv2 Backbone for JEPA-orig
+# ══════════════════════════════════════════════════════════════
+
+class DINOv2Backbone(nn.Module):
+    """
+    DINOv2 ViT-S/14 wrapper with patch masking support for JEPA.
+    Pretrained on LVD-142M (self-supervised).
+    """
+    def __init__(self, model_name="dinov2_vits14", img_size=112):
+        super().__init__()
+        self.dino = torch.hub.load("facebookresearch/dinov2", model_name)
+        self.embed_dim = self.dino.embed_dim
+        self.patch_size = self.dino.patch_embed.patch_size[0]
+        self.grid_size = img_size // self.patch_size
+        self.num_patches = self.grid_size * self.grid_size
+
+        # Interpolate positional embeddings for our image size
+        self._interpolate_pos_embed()
+
+    def _interpolate_pos_embed(self):
+        pos = self.dino.pos_embed.data  # (1, 1+N_orig, D)
+        cls_pos = pos[:, :1, :]
+        patch_pos = pos[:, 1:, :]
+        orig_grid = int(patch_pos.shape[1] ** 0.5)
+        patch_pos = patch_pos.reshape(1, orig_grid, orig_grid, -1
+                                       ).permute(0, 3, 1, 2)
+        patch_pos = F.interpolate(patch_pos,
+                                   size=(self.grid_size, self.grid_size),
+                                   mode='bicubic', align_corners=False)
+        patch_pos = patch_pos.permute(0, 2, 3, 1).reshape(
+            1, self.num_patches, -1)
+        new_pos = torch.cat([cls_pos, patch_pos], dim=1)
+        self.dino.pos_embed = nn.Parameter(new_pos, requires_grad=False)
+
+    def _prepare_tokens(self, x):
+        B = x.shape[0]
+        patches = self.dino.patch_embed(x)  # (B, N, D)
+        cls = self.dino.cls_token.expand(B, -1, -1)
+        tokens = torch.cat([cls, patches], dim=1)  # (B, 1+N, D)
+        tokens = tokens + self.dino.pos_embed
+        return tokens
+
+    def forward_patches(self, x, patch_mask=None):
+        """
+        Forward with optional patch masking for JEPA.
+
+        patch_mask: (B, M) integer indices of visible patches (0 to N-1)
+        Returns: (B, 1+M, D) if masked, (B, 1+N, D) if not
+        """
+        tokens = self._prepare_tokens(x)
+
+        if patch_mask is not None:
+            B, M = patch_mask.shape
+            cls = tokens[:, :1, :]
+            patches = tokens[:, 1:, :]
+            idx = patch_mask.unsqueeze(-1).expand(B, M, self.embed_dim)
+            selected = torch.gather(patches, 1, idx)
+            tokens = torch.cat([cls, selected], dim=1)
+
+        for blk in self.dino.blocks:
+            tokens = blk(tokens)
+        tokens = self.dino.norm(tokens)
+        return tokens
+
+    def forward(self, x):
+        """CLS token, L2 normalized."""
+        tokens = self.forward_patches(x)
+        return F.normalize(tokens[:, 0, :], dim=-1)
+
+    def forward_raw(self, x):
+        """CLS token, raw (no L2 norm)."""
+        tokens = self.forward_patches(x)
+        return tokens[:, 0, :]
+
+    def freeze_except_last_n(self, n_blocks):
+        """Freeze all except last n transformer blocks + final norm."""
+        self.requires_grad_(False)
+        total = len(self.dino.blocks)
+        if n_blocks > 0:
+            for blk in self.dino.blocks[total - n_blocks:]:
+                blk.requires_grad_(True)
+        self.dino.norm.requires_grad_(True)
+
+    def configure_for_tta(self, n_blocks=0):
+        """Freeze everything, unfreeze all LayerNorm + last n blocks."""
+        self.requires_grad_(False)
+        for m in self.modules():
+            if isinstance(m, nn.LayerNorm):
+                for p in m.parameters():
+                    p.requires_grad = True
+        total = len(self.dino.blocks)
+        if n_blocks > 0:
+            for blk in self.dino.blocks[total - n_blocks:]:
+                blk.requires_grad_(True)
+
+
+class DINOv2Model(nn.Module):
+    """Wrapper for DINOv2 compatible with evaluation pipeline."""
+    def __init__(self, model_name="dinov2_vits14", img_size=112):
+        super().__init__()
+        self.backbone = DINOv2Backbone(model_name, img_size)
+        self.head = None
+
+    def get_embeddings(self, x):
+        return self.backbone(x)
+
+    def get_raw_embeddings(self, x):
+        return self.backbone.forward_raw(x)
+
+    def forward_patches(self, x, patch_mask=None):
+        return self.backbone.forward_patches(x, patch_mask)
+
+    def forward(self, x):
+        return self.backbone(x)

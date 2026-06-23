@@ -147,12 +147,13 @@ def get_cfg(args=None):
                 print(f"[WARN] jepa_orig requires dinov2_vits14, "
                       f"overriding '{cfg.backbone}'")
                 cfg.backbone = "dinov2_vits14"
-            cfg.img_size = 112
+        elif cfg.backbone == "dinov2_vits14":
+            pass  # allow DINOv2 with contrastive
         elif cfg.backbone != "arcface_r100":
             print(f"[WARN] CASIA-MS requires arcface_r100, "
                   f"overriding '{cfg.backbone}'")
             cfg.backbone = "arcface_r100"
-            cfg.img_size = 112
+        cfg.img_size = 112
     else:
         cfg.is_verification = False
 

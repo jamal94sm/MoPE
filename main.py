@@ -702,8 +702,60 @@ def adapt_casia_ms_dino(cfg):
 
         warm_predictor_state = deepcopy(predictor.state_dict())
         print(f"  Done. sim={sim:.3f}")
-    else:
-        print(f"  No Phase 1 (using pretrained DINOv2 directly)")
+
+    elif cfg.tta_method == "contrastive":
+        print(f"\n{'─'*70}")
+        print(f"  PHASE 1: Contrastive pretraining on source (no labels)")
+        print(f"  {cfg.jepa_pretrain_epochs} epochs, "
+              f"last {cfg.dino_train_blocks} blocks unfrozen")
+        print(f"  Loss: NT-Xent + strong aug + FFT")
+        print(f"{'─'*70}")
+
+        model.backbone.freeze_except_last_n(cfg.dino_train_blocks)
+        n_tr = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"  Trainable backbone: {n_tr/1e6:.2f}M")
+
+        train_params = [p for p in model.parameters() if p.requires_grad]
+        opt = torch.optim.AdamW(train_params, lr=cfg.arcface_lr,
+                                 weight_decay=cfg.arcface_wd)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            opt, T_max=cfg.jepa_pretrain_epochs, eta_min=1e-6)
+        aug_tf = tent.get_tta_augmentation(cfg.img_size)
+
+        for epoch in range(1, cfg.jepa_pretrain_epochs + 1):
+            model.train()
+            ep_loss = 0.0; n_bat = 0
+            for imgs, _ in backbone_train_loader:
+                imgs = imgs.to(cfg.device)
+
+                # Raw embeddings (CLS token)
+                z_orig = model.get_raw_embeddings(imgs)
+
+                # Augmented view (strong aug + FFT)
+                x_aug = tent.augment_batch(
+                    imgs, aug_tf, use_fft=True, fft_beta=0.5)
+                z_aug = model.get_raw_embeddings(x_aug)
+
+                loss = tent.nt_xent_loss(
+                    F.normalize(z_orig, dim=-1),
+                    F.normalize(z_aug, dim=-1),
+                    cfg.contrastive_temp)
+
+                opt.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(train_params, 5.0)
+                opt.step()
+
+                ep_loss += loss.item()
+                n_bat += 1
+
+            scheduler.step()
+            ts = time.strftime("%H:%M:%S")
+            if epoch % 5 == 0 or epoch == cfg.jepa_pretrain_epochs:
+                print(f"  [{ts}] ep {epoch:03d}/{cfg.jepa_pretrain_epochs}  "
+                      f"loss={ep_loss/n_bat:.4f}")
+
+        print(f"  Done.")
 
     model.eval()
     print(f"\n{'─'*70}")

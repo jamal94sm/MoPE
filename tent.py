@@ -259,8 +259,13 @@ class JEPATTA(nn.Module):
         self.fft_beta = fft_beta
         self.steps = steps
 
-        self.loss_fn = (F.smooth_l1_loss if loss_fn == "smooth_l1"
-                        else F.mse_loss)
+        if loss_fn == "smooth_l1":
+            self.loss_fn = F.smooth_l1_loss
+        elif loss_fn == "cosine":
+            self.loss_fn = lambda z_p, z_t: (
+                1 - F.cosine_similarity(z_p, z_t, dim=-1)).mean()
+        else:
+            self.loss_fn = F.mse_loss
 
         # Teacher = frozen EMA copy of student
         self.teacher = deepcopy(model)
@@ -366,8 +371,13 @@ class JEPAContrastive(nn.Module):
         self.fft_beta = fft_beta
         self.steps = steps
 
-        self.jepa_loss_fn = (F.smooth_l1_loss if loss_fn == "smooth_l1"
-                             else F.mse_loss)
+        if loss_fn == "smooth_l1":
+            self.jepa_loss_fn = F.smooth_l1_loss
+        elif loss_fn == "cosine":
+            self.jepa_loss_fn = lambda z_p, z_t: (
+                1 - F.cosine_similarity(z_p, z_t, dim=-1)).mean()
+        else:
+            self.jepa_loss_fn = F.mse_loss
 
         self.teacher = deepcopy(model)
         self.teacher.requires_grad_(False)
